@@ -10,7 +10,7 @@ a typed `ResourceLimitConfigError`; invalid values are never clamped.
 These are library **per-session** limits. They are not process-wide admission
 control.
 
-## Defaults
+## Default build
 
 | Limit | Default |
 | --- | ---: |
@@ -33,6 +33,31 @@ control.
 | outstanding global requests | 1 |
 | decompressed packet payload | 34,708 bytes |
 | handshake, authentication, idle, total deadlines | disabled |
+
+## Compile-time channel capacity
+
+The fixed channel table defaults to four entries. An embedding build can opt
+into a larger bounded table through the package dependency options:
+
+```zig
+const sshz_dep = b.dependency("sshz", .{
+    .target = target,
+    .optimize = optimize,
+    .channel_capacity = 8,
+});
+```
+
+`ResourceCapacities.channels` reports the selected ceiling.
+`ResourceLimits.max_channels` defaults to that ceiling and can enforce a lower
+per-session limit, but initialization rejects a value above it. The capacity
+must be between 1 and 255.
+
+Increasing the capacity increases every client and server session's fixed
+storage even when fewer channels are active. Each channel slot includes a
+34,653-byte write buffer, aggregate pending-write capacity is
+`channel_capacity * 34,653`, and client exit-result and pending-reply tables
+also scale with the capacity. Embedders should account for this linear growth
+when deciding whether to place session values on the stack or heap.
 
 The default client authentication strategy remains separately bounded as
 before. The server count includes unsupported, probe, and failed requests so a

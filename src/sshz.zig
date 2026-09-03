@@ -2411,9 +2411,11 @@ test "resource limits validate defaults capacities and invalid relationships" {
     limits.max_payload_size = ResourceCapacities.payload_size + 1;
     try std.testing.expectError(error.PayloadLimitExceedsCapacity, limits.validate());
 
-    limits = .{};
-    limits.max_channels = ResourceCapacities.channels + 1;
-    try std.testing.expectError(error.ChannelLimitExceedsCapacity, limits.validate());
+    if (ResourceCapacities.channels < std.math.maxInt(u8)) {
+        limits = .{};
+        limits.max_channels = ResourceCapacities.channels + 1;
+        try std.testing.expectError(error.ChannelLimitExceedsCapacity, limits.validate());
+    }
 
     limits = .{};
     limits.initial_channel_window = 2;
