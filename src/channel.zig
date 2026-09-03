@@ -1,8 +1,15 @@
 const std = @import("std");
 const Protocol = @import("protocol.zig");
+const build_options = @import("sshz_build_options");
 
-pub const MaxChannels = 4;
+pub const MaxChannels: u8 = build_options.channel_capacity;
 pub const MaxPendingChannelData = MaxChannels * Protocol.MaxChannelDataLen;
+
+comptime {
+    if (MaxChannels == 0) {
+        @compileError("channel_capacity must be greater than zero");
+    }
+}
 
 pub const ChannelError = error{
     ChannelPacketTooLarge,

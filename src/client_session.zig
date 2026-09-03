@@ -2937,6 +2937,111 @@ test "disabled auto session emits Connected without consuming a channel slot" {
     try std.testing.expectEqual(@as(u32, 1), m.session.channel_table.activeCount());
 }
 
+test "configured channel capacity supports concurrent tunnel channels" {
+    const runtime_channel_limit: u8 = 6;
+    if (MaxChannels < runtime_channel_limit) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(42);
+    var limits: Sshz.ResourceLimits = .{};
+    limits.max_channels = runtime_channel_limit;
+    var m = try SshzClient.initWithLimits(
+        prng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    try m.setAutoSessionEnabled(false);
+    m.session.encrypted = false;
+    m.session.current_auth_method = .None;
+    m.session.setSessionState(.AuthRsp);
+    m.iostate_rd = .Idle;
+    m.iostate_wr = .Idle;
+
+    var auth_payload = [_]u8{@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS)};
+    const auth_packet_len = buildUnencryptedPacket(&m.iobuf_rd, &auth_payload);
+    try m.session.handlePacket(m.iobuf_rd[0..auth_packet_len], &m);
+    try m.advance();
+    try m.clearEvent(.Connected);
+
+    var channel_ids: [runtime_channel_limit]u32 = undefined;
+    for (&channel_ids, 0..) |*channel_id, index| {
+        channel_id.* = try m.openDirectTcpipChannel(
+            "example.com",
+            443,
+            "127.0.0.1",
+            @intCast(50_000 + index),
+        );
+        const open_packet = try m.peek(Protocol.MaxSSHPacket);
+        try m.consumed(open_packet.len);
+
+        var confirmation_backing: [32]u8 = undefined;
+        var confirmation = BufferWriter.init(&confirmation_backing, 0);
+        try confirmation.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+        try confirmation.writeU32(channel_id.*);
+        try confirmation.writeU32(@intCast(100 + index));
+        try confirmation.writeU32(32768);
+        try confirmation.writeU32(4096);
+        const confirmation_len = buildUnencryptedPacket(&m.iobuf_rd, confirmation.active());
+        m.iostate_rd = .Idle;
+        try m.session.handlePacket(m.iobuf_rd[0..confirmation_len], &m);
+        try m.clearEvent(.{ .ChannelOpened = channel_id.* });
+    }
+
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit), m.session.channel_table.activeCount());
+    try std.testing.expectError(
+        IoError.tooManyChannels,
+        m.openDirectTcpipChannel("example.com", 443, "127.0.0.1", 60_000),
+    );
+
+    for (channel_ids, 0..) |channel_id, index| {
+        var expected = [_]u8{@as(u8, @intCast(index + 1))};
+        try expectChannelData(&m, channel_id, &expected);
+    }
+
+    for (channel_ids, 0..) |channel_id, index| {
+        const destination = try m.getChannelWriteBuffer(channel_id);
+        destination[0] = @intCast(index + 11);
+        try m.channelWriteComplete(channel_id, 1);
+
+        const data_packet = try m.peek(Protocol.MaxSSHPacket);
+        var data_reader = BufferReader.init(unencryptedPayload(data_packet));
+        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA), try data_reader.readU8());
+        try std.testing.expectEqual(@as(u32, @intCast(100 + index)), try data_reader.readU32());
+        try std.testing.expectEqualSlices(u8, destination[0..1], try data_reader.readU32LenString());
+        try m.consumed(data_packet.len);
+    }
+
+    var eof_payload: [5]u8 = undefined;
+    eof_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF);
+    std.mem.writeInt(u32, eof_payload[1..5], channel_ids[1], .big);
+    const eof_packet_len = buildUnencryptedPacket(&m.iobuf_rd, &eof_payload);
+    m.iostate_rd = .Idle;
+    try m.session.handlePacket(m.iobuf_rd[0..eof_packet_len], &m);
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[1]).?.eof_received);
+    try std.testing.expect(!m.session.channel_table.findByLocalId(channel_ids[0]).?.eof_received);
+
+    try m.sendChannelClose(channel_ids[3]);
+    const close_packet = try m.peek(Protocol.MaxSSHPacket);
+    var close_reader = BufferReader.init(unencryptedPayload(close_packet));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
+    try std.testing.expectEqual(@as(u32, 103), try close_reader.readU32());
+    try m.consumed(close_packet.len);
+
+    var close_payload: [5]u8 = undefined;
+    close_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
+    std.mem.writeInt(u32, close_payload[1..5], channel_ids[3], .big);
+    const close_reply_len = buildUnencryptedPacket(&m.iobuf_rd, &close_payload);
+    m.iostate_rd = .Idle;
+    try m.session.handlePacket(m.iobuf_rd[0..close_reply_len], &m);
+
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[3]) == null);
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[0]) != null);
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[1]) != null);
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit - 1), m.session.channel_table.activeCount());
+}
+
 test "disabled auto session rejects session-dependent configuration" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
