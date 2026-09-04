@@ -194,6 +194,12 @@ pub const Channel = struct {
         self.tx_in_flight_len = 0;
     }
 
+    pub fn eofFlushed(self: *const Self) bool {
+        return self.eof_sent and !self.eof_pending and
+            self.write_buf_nbytes == 0 and self.tx_in_flight_len == 0 and
+            self.control_in_flight == null;
+    }
+
     pub fn consumeLocalWindow(self: *Self, len: usize) ChannelError!void {
         if (len > self.local_max_packet_size) return error.ChannelPacketTooLarge;
         if (len > self.local_window) return error.ReceiveWindowExceeded;

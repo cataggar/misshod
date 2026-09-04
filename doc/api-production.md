@@ -217,7 +217,8 @@ by connection cleanup, not acceptance or an indefinite pending event.
    `ChannelClosed(channel_id)`. One channel's EOF or close does not end its
    peers.
 6. `sendChannelEof` ends the local data direction after queued data.
-   `sendChannelClose` abandons unsent data and starts close exchange.
+   `channelEofFlushed` reports when that data and EOF have been written to the
+   transport. `sendChannelClose` abandons unsent data and starts close exchange.
    `ChannelClosed` is emitted when the ordinary channel close handshake
    completes. The channel slot remains reserved until that event is cleared;
    clearing it permits slot reuse. Agent channels continue to use

@@ -1004,6 +1004,17 @@ pub const Session = struct {
         _ = try self.startPendingChannelControl(chan, sshz, &self.keydata.s2c);
     }
 
+    pub fn channelEofFlushed(self: *Self, channel_id: u32) SshzError!bool {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.kind != .Session or chan.state == .Closed or
+            chan.close_pending or chan.close_sent or chan.close_received)
+        {
+            return IoError.UnexpectedResponse;
+        }
+        if (!chan.remote_id_known) return false;
+        return chan.eofFlushed();
+    }
+
     pub fn sendChannelClose(self: *Self, channel_id: u32, sshz: *SshzServer) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
         if (chan.close_sent or chan.close_pending) return;
@@ -2757,8 +2768,10 @@ test "server channel write retains suffix across peer packet limit" {
     try std.testing.expectEqual(@as(usize, 1000), chan.tx_in_flight_len);
     try std.testing.expectEqual(@as(usize, 0), (try m.getChannelWriteBuffer(chan.local_id)).len);
     try std.testing.expectError(IoError.cannotAcceptWrite, m.channelWriteComplete(chan.local_id, 1));
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
     try m.sendChannelEof(chan.local_id);
     try std.testing.expect(chan.eof_pending);
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
 
     var received: [total_len]u8 = undefined;
     var received_len: usize = 0;
@@ -2776,7 +2789,9 @@ test "server channel write retains suffix across peer packet limit" {
     const eof_packet = try m.peek(Protocol.MaxSSHPacket);
     var eof_reader = BufferReader.init(unencryptedPayload(eof_packet));
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
     try m.consumed(eof_packet.len);
+    try std.testing.expect(try m.channelEofFlushed(chan.local_id));
     try std.testing.expect(chan.eof_sent);
     try std.testing.expect(chan.control_in_flight == null);
     try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
