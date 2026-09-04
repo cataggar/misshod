@@ -159,6 +159,8 @@ fn handleEvent(
         .ServerIdentification,
         .AuthMethodStarted,
         .Connected,
+        .ChannelEof,
+        .ChannelClosed,
         .Banner,
         => try client.clearEvent(event),
     }

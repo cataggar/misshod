@@ -345,6 +345,15 @@ fn expectClientOutcome(
             const next = try client.getNextEvent();
             switch (next) {
                 .Event => |event| switch (event) {
+                    .ChannelClosed => |channel_id| try std.testing.expectEqual(@as(u32, 0), channel_id),
+                    else => return error.UnexpectedResponse,
+                },
+                else => return error.UnexpectedResponse,
+            }
+            try client.clearEvent(.{ .ChannelClosed = 0 });
+            const terminal = try client.getNextEvent();
+            switch (terminal) {
+                .Event => |event| switch (event) {
                     .EndSession => |reason| switch (reason) {
                         .Disconnect => {},
                         else => return error.UnexpectedResponse,

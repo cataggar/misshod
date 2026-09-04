@@ -17,7 +17,7 @@ control.
 | SSH wire packet, including an encrypted packet's MAC | 35,000 bytes |
 | packet payload | 34,708 bytes |
 | channels | 4 |
-| advertised initial receive window | 34,653 bytes |
+| advertised initial receive window | 2 MiB |
 | accepted peer window | `u32` maximum |
 | advertised/accepted channel packet data | 34,653 bytes |
 | buffered data per channel | 34,653 bytes |
@@ -58,6 +58,31 @@ storage even when fewer channels are active. Each channel slot includes a
 `channel_capacity * 34,653`, and client exit-result and pending-reply tables
 also scale with the capacity. Embedders should account for this linear growth
 when deciding whether to place session values on the stack or heap.
+
+## Application-controlled receive credit
+
+Client ordinary channels automatically replenish their receive windows by
+default, preserving existing behavior. A bounded forwarding application can
+call `setAutoChannelReadCreditEnabled(false)` before channels open, then return
+credit per channel with `channelReadConsumed(channel_id, count)` only after it
+has consumed or durably buffered those bytes. Agent channels remain automatic.
+
+In manual mode, clearing `RxData` or `RxExtendedData` releases the borrowed
+packet storage but does not increase the peer's window. sshz tracks
+delivered-but-uncredited and queued-adjust bytes independently for every
+ordinary channel. Positive partial credits are accepted; zero, over-credit,
+unknown-channel, closing/closed-channel, and overflow cases are rejected
+without changing the counters. Pending adjustments share the bounded
+round-robin channel-output scheduler, so a channel with no returned credit
+does not prevent another credited channel from advancing through later window
+cycles.
+
+Set `initial_channel_window` no larger than the application's bounded
+per-channel receive capacity. The default 2 MiB window is a compatibility and
+throughput choice, not an appropriate implicit bound for an application whose
+socket-side buffer is smaller. Manual credit adds only fixed counters to each
+compiled channel slot; it does not add an unbounded queue or socket buffering
+inside sshz.
 
 The default client authentication strategy remains separately bounded as
 before. The server count includes unsupported, probe, and failed requests so a
@@ -122,11 +147,11 @@ success or failure.
 Oversized framing, decompression output, identification input, pre-auth work,
 authentication attempts, excessive/frequent KEX, invalid channel parameters,
 channel receive-window violations, channel packet violations, window
-arithmetic overflow, and buffered-data excess return typed errors. Fatal
-peer/session violations are latched fail-closed by the public I/O driver;
-retries return `SessionTerminated`. Channel data is rejected before receive
-window counters change. Window adjustment uses checked arithmetic rather than
-saturation.
+arithmetic overflow, invalid manual read credit, and buffered-data excess
+return typed errors. Fatal peer/session violations are latched fail-closed by
+the public I/O driver; retries return `SessionTerminated`. Channel data and
+manual over-credit are rejected before receive-window counters change. Window
+adjustment uses checked arithmetic rather than saturation.
 
 Only one global request can await an application/peer response. A local second
 request is rejected; a server receiving another reply-requesting forwarding

@@ -130,6 +130,7 @@ pub const Session = struct {
     pending_channel_replies_head: usize,
     pending_channel_replies_len: usize,
     pending_window_change: ?[4]u32,
+    channel_window_adjust_in_flight: bool,
     pending_global_request: ?PendingGlobalRequest,
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     agent_forwarding_enabled: bool,
@@ -142,6 +143,7 @@ pub const Session = struct {
     auto_pty_height_px: u32,
     auto_exec_command: ?[]u8,
     auto_session_enabled: bool,
+    auto_channel_read_credit_enabled: bool,
     kbd_interactive_response: ?[]u8, // allocated
     is_rekeying: bool,
     rekey_resume_state: ?SessionState,
@@ -202,6 +204,7 @@ pub const Session = struct {
             .pending_channel_replies_head = 0,
             .pending_channel_replies_len = 0,
             .pending_window_change = null,
+            .channel_window_adjust_in_flight = false,
             .pending_global_request = null,
             .agent_forwarding_enabled = false,
             .agent_forwarding_requested = false,
@@ -213,6 +216,7 @@ pub const Session = struct {
             .auto_pty_height_px = 480,
             .auto_exec_command = null,
             .auto_session_enabled = true,
+            .auto_channel_read_credit_enabled = true,
             .kbd_interactive_response = null,
             .is_rekeying = false,
             .rekey_resume_state = null,
@@ -256,6 +260,7 @@ pub const Session = struct {
         self.clearAllExitResults();
         self.pending_channel_replies_head = 0;
         self.pending_channel_replies_len = 0;
+        self.channel_window_adjust_in_flight = false;
         self.pending_global_request = null;
         self.keydata.clear();
         self.clearKexState();
@@ -696,6 +701,7 @@ pub const Session = struct {
         chan.client_open_mode = mode;
         chan.channel_type = channel_type;
         chan.tcpip_open = tcpip_open;
+        chan.automatic_read_credit = self.auto_channel_read_credit_enabled;
         chan.state = .OpenWrite;
         return chan;
     }
@@ -1063,16 +1069,7 @@ pub const Session = struct {
             !chan.eof_received and !chan.close_pending and !chan.close_sent and !chan.close_received and
             chan.needsWindowAdjust())
         {
-            var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-            try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
-            try pkt.writeU32(chan.remote_id);
-            const adjust = chan.windowAdjustAmount();
-            try pkt.writeU32(adjust);
-            chan.local_window = chan.local_window_target;
-            try sshz.requestWrite(
-                try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr),
-                .WriteCompletePreserveState,
-            );
+            _ = try self.startChannelWindowAdjust(chan, sshz, outkeys);
             chan.state = .DataRx;
             self.active_channel_id = null;
             if (self.channel_table.findNextRunnable() == null) self.setIoSessionState(.ReadPktHdr);
@@ -1261,14 +1258,12 @@ pub const Session = struct {
                 if (kind == .Session and chan.channel_type == .Session) {
                     self.completeExitResult(local_id);
                 }
-                self.channel_table.freeChannel(local_id);
                 self.active_channel_id = null;
                 if (kind == .AgentForward) {
+                    self.channel_table.freeChannel(local_id);
                     sshz.requestEvent(.{ .AgentChannelClosed = local_id }, .Idle);
-                } else if (self.channel_table.activeCount() == 0) {
-                    sshz.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
                 } else {
-                    self.setIoSessionState(.ReadPktHdr);
+                    sshz.requestEvent(.{ .ChannelClosed = local_id }, .Idle);
                 }
             },
             .ConfirmWrite => {
@@ -1649,6 +1644,63 @@ pub const Session = struct {
         return true;
     }
 
+    fn startChannelWindowAdjust(
+        self: *Self,
+        chan: *Channel,
+        sshz: *SshzClient,
+        outkeys: *Protocol.KeyDataUni,
+    ) SshzError!bool {
+        if (self.sessionState != .ChannelActive or self.is_rekeying or sshz.local_rekey_pending or
+            !chan.remote_id_known or sshz.iostate_wr != .Idle or
+            (chan.state != .Data and chan.state != .DataRx) or
+            chan.eof_received or chan.close_pending or chan.close_sent or chan.close_received or
+            !chan.needsWindowAdjust())
+        {
+            return false;
+        }
+
+        const adjust = chan.windowAdjustAmount();
+        var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
+        try pkt.writeU32(chan.remote_id);
+        try pkt.writeU32(adjust);
+        try sshz.requestWrite(
+            try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr),
+            .WriteCompletePreserveState,
+        );
+        chan.applyWindowAdjust(adjust);
+        self.channel_window_adjust_in_flight = true;
+        return true;
+    }
+
+    pub fn flushPendingChannelWindowAdjust(self: *Self, sshz: *SshzClient) SshzError!bool {
+        if (self.pending_channel_replies_len != 0 or
+            self.sessionState != .ChannelActive or self.is_rekeying or
+            sshz.local_rekey_pending or sshz.iostate_rd == .Idle or
+            sshz.iostate_wr != .Idle)
+        {
+            return false;
+        }
+        const chan = self.channel_table.findNextWindowAdjust() orelse return false;
+        return try self.startChannelWindowAdjust(chan, sshz, &self.keydata.c2s);
+    }
+
+    fn finishChannelClose(self: *Self, chan: *Channel, sshz: *SshzClient) void {
+        const local_id = chan.local_id;
+        const kind = chan.kind;
+        chan.state = .Closed;
+        if (kind == .Session and chan.channel_type == .Session) {
+            self.completeExitResult(local_id);
+        }
+        self.active_channel_id = null;
+        if (kind == .AgentForward) {
+            self.channel_table.freeChannel(local_id);
+            sshz.requestEvent(.{ .AgentChannelClosed = local_id }, .Idle);
+        } else {
+            sshz.requestEvent(.{ .ChannelClosed = local_id }, .Idle);
+        }
+    }
+
     pub fn dispatchDeferredChannelWrite(self: *Self, sshz: *SshzClient) SshzError!bool {
         if (self.sessionState != .ChannelActive or self.is_rekeying or sshz.local_rekey_pending or
             sshz.iostate_wr != .Idle) return false;
@@ -1659,6 +1711,7 @@ pub const Session = struct {
                 chan.discardWriteBuffer();
                 chan.eof_pending = false;
             }
+            if (try self.startChannelWindowAdjust(chan, sshz, &self.keydata.c2s)) return true;
             if (!chan.eof_sent and !chan.close_sent and !chan.close_pending and !chan.close_received and
                 chan.write_buf_nbytes > 0 and chan.tx_in_flight_len == 0 and chan.peer_window > 0)
             {
@@ -1671,15 +1724,52 @@ pub const Session = struct {
         return false;
     }
 
+    pub fn completeChannelWindowAdjust(self: *Self, sshz: *SshzClient) SshzError!void {
+        if (!self.channel_window_adjust_in_flight) return;
+        self.channel_window_adjust_in_flight = false;
+        _ = try self.dispatchDeferredChannelWrite(sshz);
+    }
+
+    pub fn channelReadConsumed(
+        self: *Self,
+        channel_id: u32,
+        count: usize,
+        sshz: *SshzClient,
+    ) SshzError!void {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse
+            return IoError.UnexpectedResponse;
+        if (chan.kind != .Session or chan.automatic_read_credit or
+            chan.state == .Closed or chan.close_pending or chan.close_sent or chan.close_received)
+        {
+            return IoError.UnexpectedResponse;
+        }
+        try chan.queueReadCredit(count);
+        _ = try self.dispatchDeferredChannelWrite(sshz);
+    }
+
+    pub fn releaseClosedChannel(self: *Self, channel_id: u32) SshzError!bool {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse
+            return IoError.badClearEvent;
+        if (chan.kind != .Session or chan.state != .Closed) {
+            return IoError.badClearEvent;
+        }
+        self.channel_table.freeChannel(channel_id);
+        self.active_channel_id = null;
+        return self.shouldEndAfterChannelRelease();
+    }
+
+    pub fn shouldEndAfterChannelRelease(self: *const Self) bool {
+        return self.auto_session_enabled and self.channel_table.activeCount() == 0;
+    }
+
     pub fn completeChannelControl(self: *Self, channel_id: u32, sshz: *SshzClient) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
         const control = chan.control_in_flight orelse return IoError.UnexpectedResponse;
         chan.control_in_flight = null;
         if (control == .Close) {
             if (chan.close_received) {
-                chan.state = .Closed;
-                self.active_channel_id = chan.local_id;
-                self.resumeChannelActive();
+                self.finishChannelClose(chan, sshz);
+                return;
             }
             const received_packet_pending = switch (self.ioSessionState) {
                 .ReadPktCompletion => true,
@@ -1746,6 +1836,11 @@ pub const Session = struct {
             return IoError.UnexpectedResponse;
         }
         self.auto_session_enabled = enabled;
+    }
+
+    pub fn setAutoChannelReadCreditEnabled(self: *Self, enabled: bool) SshzError!void {
+        if (self.channel_table.activeCount() != 0) return IoError.UnexpectedResponse;
+        self.auto_channel_read_credit_enabled = enabled;
     }
 
     pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
@@ -2049,6 +2144,7 @@ pub const Session = struct {
         };
         chan.channel_type = channel_type;
         chan.tcpip_open = tcpip_open;
+        chan.automatic_read_credit = self.auto_channel_read_credit_enabled;
         chan.state = .Open;
         self.active_channel_id = null;
         self.resumeChannelActive();
@@ -2423,7 +2519,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
                 const s = try rdr.readU32LenString();
-                try chan.consumeLocalWindow(s.len);
+                try chan.consumeReceivedData(s.len);
                 switch (chan.kind) {
                     .Session => sshz.requestEvent(.{ .RxData = .{ .channel = chan.local_id, .data = s } }, .Idle),
                     .AgentForward => sshz.requestEvent(.{ .AgentData = .{ .channel = chan.local_id, .data = s } }, .Idle),
@@ -2448,7 +2544,7 @@ pub const Session = struct {
                 }
                 const data_type = try rdr.readU32();
                 const s = try rdr.readU32LenString();
-                try chan.consumeLocalWindow(s.len);
+                try chan.consumeReceivedData(s.len);
                 sshz.requestEvent(.{ .RxExtendedData = .{
                     .channel = chan.local_id,
                     .data_type = data_type,
@@ -2475,7 +2571,17 @@ pub const Session = struct {
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
                 const channelnum = try rdr.readU32();
                 if (self.channel_table.findByLocalId(channelnum)) |chan| {
+                    if (chan.eof_received) {
+                        self.setIoSessionState(.ReadPktHdr);
+                        return;
+                    }
                     chan.eof_received = true;
+                    if (chan.kind == .Session) {
+                        self.active_channel_id = chan.local_id;
+                        self.resumeChannelActive();
+                        sshz.requestEvent(.{ .ChannelEof = chan.local_id }, .Idle);
+                        return;
+                    }
                     if (chan.write_buf_nbytes > 0 or chan.eof_pending or chan.close_pending) {
                         self.active_channel_id = chan.local_id;
                         self.resumeChannelActive();
@@ -2495,23 +2601,7 @@ pub const Session = struct {
                 chan.discardWriteBuffer();
                 chan.eof_pending = false;
                 if (chan.close_sent) {
-                    if (chan.kind == .AgentForward) {
-                        self.active_channel_id = chan.local_id;
-                        chan.state = .Closed;
-                        self.resumeChannelActive();
-                        self.setIoSessionState(.Idle);
-                    } else {
-                        if (chan.channel_type == .Session) {
-                            self.completeExitResult(chan.local_id);
-                        }
-                        self.channel_table.freeChannel(chan.local_id);
-                        self.active_channel_id = null;
-                        if (self.channel_table.activeCount() == 0) {
-                            sshz.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
-                        } else {
-                            self.setIoSessionState(.ReadPktHdr);
-                        }
-                    }
+                    self.finishChannelClose(chan, sshz);
                 } else {
                     self.active_channel_id = chan.local_id;
                     chan.close_pending = true;
@@ -2854,6 +2944,133 @@ fn confirmAutoSessionChannel(m: *SshzClient, mode: ClientChannelOpenMode) !*Chan
     return chan;
 }
 
+fn deliverChannelControlForTest(
+    m: *SshzClient,
+    message: Protocol.MsgId,
+    channel_id: u32,
+) !void {
+    var payload: [5]u8 = undefined;
+    payload[0] = @intFromEnum(message);
+    std.mem.writeInt(u32, payload[1..5], channel_id, .big);
+    const packet_len = buildUnencryptedPacket(&m.iobuf_rd, &payload);
+    m.iostate_rd = .Idle;
+    try m.session.handlePacket(m.iobuf_rd[0..packet_len], m);
+}
+
+fn expectChannelEofForTest(m: *SshzClient, channel_id: u32) !void {
+    switch (try m.getNextEvent()) {
+        .Event => |event| switch (event) {
+            .ChannelEof => |received_id| try std.testing.expectEqual(channel_id, received_id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectChannelClosedForTest(m: *SshzClient, channel_id: u32) !void {
+    switch (try m.getNextEvent()) {
+        .Event => |event| switch (event) {
+            .ChannelClosed => |received_id| try std.testing.expectEqual(channel_id, received_id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectAgentChannelClosedForTest(m: *SshzClient, channel_id: u32) !void {
+    switch (try m.getNextEvent()) {
+        .Event => |event| switch (event) {
+            .AgentChannelClosed => |received_id| try std.testing.expectEqual(channel_id, received_id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectDisconnectForTest(m: *SshzClient) !void {
+    switch (try m.getNextEvent()) {
+        .Event => |event| switch (event) {
+            .EndSession => |reason| switch (reason) {
+                .Disconnect => {},
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn openConfirmedDirectTcpipForTest(
+    m: *SshzClient,
+    remote_id: u32,
+    originator_port: u32,
+) !u32 {
+    const channel_id = try m.openDirectTcpipChannel(
+        "example.com",
+        443,
+        "127.0.0.1",
+        originator_port,
+    );
+    const open_packet = try m.peek(Protocol.MaxSSHPacket);
+    try m.consumed(open_packet.len);
+
+    var confirmation_backing: [32]u8 = undefined;
+    var confirmation = BufferWriter.init(&confirmation_backing, 0);
+    try confirmation.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try confirmation.writeU32(channel_id);
+    try confirmation.writeU32(remote_id);
+    try confirmation.writeU32(32768);
+    try confirmation.writeU32(4096);
+    const confirmation_len = buildUnencryptedPacket(&m.iobuf_rd, confirmation.active());
+    m.iostate_rd = .Idle;
+    try m.session.handlePacket(m.iobuf_rd[0..confirmation_len], m);
+    switch (try m.getNextEvent()) {
+        .Event => |event| switch (event) {
+            .ChannelOpened => |opened_id| try std.testing.expectEqual(channel_id, opened_id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try m.clearEvent(.{ .ChannelOpened = channel_id });
+    return channel_id;
+}
+
+fn expectWindowAdjustForTest(
+    m: *SshzClient,
+    remote_id: u32,
+    amount: u32,
+) !void {
+    const packet = try m.peek(Protocol.MaxSSHPacket);
+    var reader = BufferReader.init(unencryptedPayload(packet));
+    try std.testing.expectEqual(
+        @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST),
+        try reader.readU8(),
+    );
+    try std.testing.expectEqual(remote_id, try reader.readU32());
+    try std.testing.expectEqual(amount, try reader.readU32());
+    try m.consumed(packet.len);
+}
+
+fn sendChannelDataForTest(
+    m: *SshzClient,
+    channel_id: u32,
+    remote_id: u32,
+    byte: u8,
+) !void {
+    const destination = try m.getChannelWriteBuffer(channel_id);
+    destination[0] = byte;
+    try m.channelWriteComplete(channel_id, 1);
+    const packet = try m.peek(Protocol.MaxSSHPacket);
+    var reader = BufferReader.init(unencryptedPayload(packet));
+    try std.testing.expectEqual(
+        @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA),
+        try reader.readU8(),
+    );
+    try std.testing.expectEqual(remote_id, try reader.readU32());
+    try std.testing.expectEqualSlices(u8, destination[0..1], try reader.readU32LenString());
+    try m.consumed(packet.len);
+}
+
 test "none auth queues request before method-started event" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -2938,7 +3155,7 @@ test "disabled auto session emits Connected without consuming a channel slot" {
 }
 
 test "configured channel capacity supports concurrent tunnel channels" {
-    const runtime_channel_limit: u8 = 6;
+    const runtime_channel_limit: u8 = 8;
     if (MaxChannels < runtime_channel_limit) return error.SkipZigTest;
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -2967,26 +3184,11 @@ test "configured channel capacity supports concurrent tunnel channels" {
 
     var channel_ids: [runtime_channel_limit]u32 = undefined;
     for (&channel_ids, 0..) |*channel_id, index| {
-        channel_id.* = try m.openDirectTcpipChannel(
-            "example.com",
-            443,
-            "127.0.0.1",
+        channel_id.* = try openConfirmedDirectTcpipForTest(
+            &m,
+            @intCast(100 + index),
             @intCast(50_000 + index),
         );
-        const open_packet = try m.peek(Protocol.MaxSSHPacket);
-        try m.consumed(open_packet.len);
-
-        var confirmation_backing: [32]u8 = undefined;
-        var confirmation = BufferWriter.init(&confirmation_backing, 0);
-        try confirmation.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
-        try confirmation.writeU32(channel_id.*);
-        try confirmation.writeU32(@intCast(100 + index));
-        try confirmation.writeU32(32768);
-        try confirmation.writeU32(4096);
-        const confirmation_len = buildUnencryptedPacket(&m.iobuf_rd, confirmation.active());
-        m.iostate_rd = .Idle;
-        try m.session.handlePacket(m.iobuf_rd[0..confirmation_len], &m);
-        try m.clearEvent(.{ .ChannelOpened = channel_id.* });
     }
 
     try std.testing.expectEqual(@as(u32, runtime_channel_limit), m.session.channel_table.activeCount());
@@ -3013,14 +3215,13 @@ test "configured channel capacity supports concurrent tunnel channels" {
         try m.consumed(data_packet.len);
     }
 
-    var eof_payload: [5]u8 = undefined;
-    eof_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF);
-    std.mem.writeInt(u32, eof_payload[1..5], channel_ids[1], .big);
-    const eof_packet_len = buildUnencryptedPacket(&m.iobuf_rd, &eof_payload);
-    m.iostate_rd = .Idle;
-    try m.session.handlePacket(m.iobuf_rd[0..eof_packet_len], &m);
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_EOF, channel_ids[1]);
+    try expectChannelEofForTest(&m, channel_ids[1]);
+    try expectChannelEofForTest(&m, channel_ids[1]);
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[1]).?.eof_received);
     try std.testing.expect(!m.session.channel_table.findByLocalId(channel_ids[0]).?.eof_received);
+    try m.clearEvent(.{ .ChannelEof = channel_ids[1] });
+    try sendChannelDataForTest(&m, channel_ids[0], 100, 0xa0);
 
     try m.sendChannelClose(channel_ids[3]);
     const close_packet = try m.peek(Protocol.MaxSSHPacket);
@@ -3029,17 +3230,266 @@ test "configured channel capacity supports concurrent tunnel channels" {
     try std.testing.expectEqual(@as(u32, 103), try close_reader.readU32());
     try m.consumed(close_packet.len);
 
-    var close_payload: [5]u8 = undefined;
-    close_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
-    std.mem.writeInt(u32, close_payload[1..5], channel_ids[3], .big);
-    const close_reply_len = buildUnencryptedPacket(&m.iobuf_rd, &close_payload);
-    m.iostate_rd = .Idle;
-    try m.session.handlePacket(m.iobuf_rd[0..close_reply_len], &m);
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, channel_ids[3]);
+    try expectChannelClosedForTest(&m, channel_ids[3]);
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[3]) != null);
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit), m.session.channel_table.activeCount());
+    try std.testing.expectError(
+        IoError.cannotAcceptWrite,
+        m.openDirectTcpipChannel("example.com", 443, "127.0.0.1", 60_000),
+    );
+    try m.clearEvent(.{ .ChannelClosed = channel_ids[3] });
 
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[3]) == null);
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[0]) != null);
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_ids[1]) != null);
     try std.testing.expectEqual(@as(u32, runtime_channel_limit - 1), m.session.channel_table.activeCount());
+
+    const replacement_id = try openConfirmedDirectTcpipForTest(&m, 203, 60_003);
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit), replacement_id);
+    channel_ids[3] = replacement_id;
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit), m.session.channel_table.activeCount());
+    try sendChannelDataForTest(&m, channel_ids[4], 104, 0xa4);
+
+    for (channel_ids) |channel_id| {
+        const chan = m.session.channel_table.findByLocalId(channel_id).?;
+        const remote_id = chan.remote_id;
+        try m.sendChannelClose(channel_id);
+        const local_close = try m.peek(Protocol.MaxSSHPacket);
+        var local_close_reader = BufferReader.init(unencryptedPayload(local_close));
+        try std.testing.expectEqual(
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE),
+            try local_close_reader.readU8(),
+        );
+        try std.testing.expectEqual(remote_id, try local_close_reader.readU32());
+        try m.consumed(local_close.len);
+        try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, channel_id);
+        try expectChannelClosedForTest(&m, channel_id);
+        try m.clearEvent(.{ .ChannelClosed = channel_id });
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), m.session.channel_table.activeCount());
+    try std.testing.expectEqual(SessionState.ChannelActive, m.session.sessionState);
+    try std.testing.expect(m.session.user_authenticated);
+    try std.testing.expect(!m.terminated);
+
+    const reused_after_idle = try openConfirmedDirectTcpipForTest(&m, 300, 61_000);
+    try std.testing.expectEqual(@as(u32, runtime_channel_limit + 1), reused_after_idle);
+    try expectChannelData(&m, reused_after_idle, "after-zero-channel-idle");
+}
+
+test "manual ordinary channel read credit isolates blocked channels" {
+    const limits = Sshz.ResourceLimits{
+        .max_channels = 2,
+        .initial_channel_window = 8,
+        .max_channel_window = 32768,
+        .channel_packet_size = 4,
+        .max_peer_packet_size = 4096,
+    };
+    var prng = std.Random.DefaultPrng.init(43);
+    var m = try SshzClient.initWithLimits(
+        prng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    try m.setAutoSessionEnabled(false);
+    try m.setAutoChannelReadCreditEnabled(false);
+    m.session.encrypted = false;
+    m.session.current_auth_method = .None;
+    m.session.setSessionState(.AuthRsp);
+    var auth_payload = [_]u8{@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS)};
+    const auth_packet_len = buildUnencryptedPacket(&m.iobuf_rd, &auth_payload);
+    try m.session.handlePacket(m.iobuf_rd[0..auth_packet_len], &m);
+    try m.advance();
+    try m.clearEvent(.Connected);
+
+    const blocked_id = try openConfirmedDirectTcpipForTest(&m, 400, 62_000);
+    const flowing_id = try openConfirmedDirectTcpipForTest(&m, 401, 62_001);
+    const blocked = m.session.channel_table.findByLocalId(blocked_id).?;
+    const flowing = m.session.channel_table.findByLocalId(flowing_id).?;
+    try std.testing.expect(!blocked.automatic_read_credit);
+    try std.testing.expect(!flowing.automatic_read_credit);
+    try std.testing.expectError(
+        IoError.UnexpectedResponse,
+        m.setAutoChannelReadCreditEnabled(true),
+    );
+
+    try expectChannelData(&m, blocked_id, "aaaa");
+    try std.testing.expectEqual(ChannelState.DataRx, blocked.state);
+    try expectChannelData(&m, blocked_id, "bbbb");
+    try std.testing.expectEqual(@as(u32, 0), blocked.local_window);
+    try std.testing.expectEqual(@as(u32, 8), blocked.delivered_uncredited);
+    try std.testing.expectEqual(@as(u32, 0), blocked.pending_window_adjust);
+    try std.testing.expectEqual(@as(usize, 0), m.wr_nbytes);
+    for (m.iobuf_rd) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (m.iobuf_decompressed) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    try std.testing.expectError(
+        error.InvalidChannelReadCredit,
+        m.channelReadConsumed(blocked_id, 0),
+    );
+    try std.testing.expectError(
+        error.ChannelReadCreditExceeded,
+        m.channelReadConsumed(blocked_id, 9),
+    );
+    try std.testing.expectEqual(@as(u32, 8), blocked.delivered_uncredited);
+    try std.testing.expectEqual(@as(u32, 0), blocked.pending_window_adjust);
+
+    for (0..6) |cycle| {
+        const byte: u8 = @intCast('c' + cycle);
+        const data = [4]u8{ byte, byte, byte, byte };
+        try expectChannelData(&m, flowing_id, &data);
+        try std.testing.expectEqual(@as(u32, 4), flowing.delivered_uncredited);
+        try std.testing.expectEqual(@as(u32, 4), flowing.local_window);
+        try std.testing.expectEqual(@as(u32, 0), blocked.local_window);
+        try std.testing.expectEqual(@as(u32, 8), blocked.delivered_uncredited);
+
+        if (cycle == 0) {
+            try m.channelReadConsumed(flowing_id, 2);
+            try expectWindowAdjustForTest(&m, flowing.remote_id, 2);
+            try std.testing.expectEqual(@as(u32, 2), flowing.delivered_uncredited);
+            try std.testing.expectEqual(@as(u32, 6), flowing.local_window);
+            try m.channelReadConsumed(flowing_id, 2);
+            try expectWindowAdjustForTest(&m, flowing.remote_id, 2);
+        } else {
+            try m.channelReadConsumed(flowing_id, 4);
+            try expectWindowAdjustForTest(&m, flowing.remote_id, 4);
+        }
+        try std.testing.expectEqual(@as(u32, 0), flowing.delivered_uncredited);
+        try std.testing.expectEqual(@as(u32, 8), flowing.local_window);
+        try std.testing.expectEqual(@as(u32, 0), blocked.local_window);
+    }
+
+    try std.testing.expectError(
+        error.ChannelReadCreditExceeded,
+        m.channelReadConsumed(flowing_id, 1),
+    );
+    try std.testing.expectError(
+        IoError.UnexpectedResponse,
+        m.channelReadConsumed(9999, 1),
+    );
+
+    try m.sendChannelClose(flowing_id);
+    const close_packet = try m.peek(Protocol.MaxSSHPacket);
+    try m.consumed(close_packet.len);
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, flowing_id);
+    try expectChannelClosedForTest(&m, flowing_id);
+    try std.testing.expectError(
+        IoError.UnexpectedResponse,
+        m.channelReadConsumed(flowing_id, 1),
+    );
+    try m.clearEvent(.{ .ChannelClosed = flowing_id });
+}
+
+test "manual channel window adjusts are round-robin with deferred output" {
+    const limits = Sshz.ResourceLimits{
+        .max_channels = 2,
+        .initial_channel_window = 8,
+        .max_channel_window = 100,
+        .channel_packet_size = 4,
+        .max_peer_packet_size = 100,
+    };
+    var prng = std.Random.DefaultPrng.init(44);
+    var m = try SshzClient.initWithLimits(
+        prng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    const first = m.session.channel_table.allocChannel(500, 100, 100).?;
+    first.state = .DataRx;
+    first.automatic_read_credit = false;
+    first.local_window = 4;
+    first.delivered_uncredited = 4;
+    try first.queueReadCredit(4);
+    first.write_buf[0] = 'x';
+    first.write_buf_nbytes = 1;
+
+    const second = m.session.channel_table.allocChannel(501, 100, 100).?;
+    second.state = .DataRx;
+    second.automatic_read_credit = false;
+    second.local_window = 4;
+    second.delivered_uncredited = 4;
+    try second.queueReadCredit(4);
+
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+    m.requestRead(0, 1, .ReadPktHdr);
+
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    try expectWindowAdjustForTest(&m, second.remote_id, 4);
+    try expectWindowAdjustForTest(&m, first.remote_id, 4);
+
+    const data_packet = try m.peek(Protocol.MaxSSHPacket);
+    var data_reader = BufferReader.init(unencryptedPayload(data_packet));
+    try std.testing.expectEqual(
+        @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA),
+        try data_reader.readU8(),
+    );
+    try std.testing.expectEqual(first.remote_id, try data_reader.readU32());
+    try std.testing.expectEqualStrings("x", try data_reader.readU32LenString());
+    try m.consumed(data_packet.len);
+    try std.testing.expectEqual(@as(u32, 8), first.local_window);
+    try std.testing.expectEqual(@as(u32, 8), second.local_window);
+}
+
+test "manual read credit flushes after unrelated write during packet header read" {
+    const limits = Sshz.ResourceLimits{
+        .max_channels = 1,
+        .initial_channel_window = 8,
+        .max_channel_window = 100,
+        .channel_packet_size = 4,
+        .max_peer_packet_size = 100,
+    };
+    var prng = std.Random.DefaultPrng.init(45);
+    var m = try SshzClient.initWithLimits(
+        prng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(502, 100, 100).?;
+    chan.state = .DataRx;
+    chan.automatic_read_credit = false;
+    chan.local_window = 4;
+    chan.delivered_uncredited = 4;
+
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+    m.requestRead(
+        0,
+        Protocol.sizeof_PktHdr,
+        .{ .ReadPktBody = m.iobuf_rd[0..Protocol.sizeof_PktHdr] },
+    );
+
+    try m.session.queueChannelReply(503, false);
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    const reply = try m.peek(Protocol.MaxSSHPacket);
+    var reply_reader = BufferReader.init(unencryptedPayload(reply));
+    try std.testing.expectEqual(
+        @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE),
+        try reply_reader.readU8(),
+    );
+    try std.testing.expectEqual(@as(u32, 503), try reply_reader.readU32());
+
+    try m.channelReadConsumed(chan.local_id, 4);
+    try std.testing.expectEqual(@as(u32, 4), chan.pending_window_adjust);
+    try std.testing.expectEqual(@as(u32, 4), chan.local_window);
+
+    try m.consumed(reply.len);
+    try expectWindowAdjustForTest(&m, chan.remote_id, 4);
+    try std.testing.expectEqual(@as(u32, 0), chan.pending_window_adjust);
+    try std.testing.expectEqual(@as(u32, 8), chan.local_window);
+    try std.testing.expect(m.iostate_rd != .Idle);
 }
 
 test "disabled auto session rejects session-dependent configuration" {
@@ -4178,6 +4628,7 @@ fn expectChannelData(m: *SshzClient, channel: u32, data: []const u8) !void {
     try payload.writeU32LenString(data);
 
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    m.iostate_rd = .Idle;
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], m);
 
     switch (try m.getNextEvent()) {
@@ -4479,7 +4930,32 @@ test "handlePacket: SSH_MSG_CHANNEL_CLOSE when not yet sent triggers close reply
     try std.testing.expectEqual(@as(usize, 0), chan.write_buf_nbytes);
 }
 
-test "handlePacket: SSH_MSG_CHANNEL_CLOSE when already sent emits disconnect" {
+test "ordinary channel EOF is emitted once and does not affect peers" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const eof_channel = m.session.channel_table.allocChannel(10, 32768, 32768).?;
+    eof_channel.state = .DataRx;
+    const peer_channel = m.session.channel_table.allocChannel(11, 32768, 32768).?;
+    peer_channel.state = .DataRx;
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_EOF, eof_channel.local_id);
+    try expectChannelEofForTest(&m, eof_channel.local_id);
+    try m.clearEvent(.{ .ChannelEof = eof_channel.local_id });
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_EOF, eof_channel.local_id);
+    switch (try m.getNextEvent()) {
+        .Event => return error.TestUnexpectedResult,
+        else => {},
+    }
+    try std.testing.expect(!peer_channel.eof_received);
+    try expectChannelData(&m, peer_channel.local_id, "peer-still-active");
+}
+
+test "handlePacket: SSH_MSG_CHANNEL_CLOSE emits close before terminal end" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
@@ -4501,6 +4977,15 @@ test "handlePacket: SSH_MSG_CHANNEL_CLOSE when already sent emits disconnect" {
 
     const evt = try m.getNextEvent();
     switch (evt) {
+        .Event => |code| switch (code) {
+            .ChannelClosed => |channel_id| try std.testing.expectEqual(@as(u32, 0), channel_id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(m.session.channel_table.findByLocalId(0) != null);
+    try m.clearEvent(.{ .ChannelClosed = 0 });
+    switch (try m.getNextEvent()) {
         .Event => |code| switch (code) {
             .EndSession => {},
             else => return error.TestUnexpectedResult,
@@ -4752,6 +5237,72 @@ test "client direct write retains suffix across peer packet and window limits" {
     try std.testing.expectError(IoError.UnexpectedResponse, m.channelWriteComplete(chan.local_id, 1));
 }
 
+test "automatic session ends after session channel closes before agent channel" {
+    var prng = std.Random.DefaultPrng.init(46);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const session_chan = m.session.channel_table.allocChannel(20, 32768, 32768).?;
+    session_chan.state = .DataRx;
+    session_chan.close_sent = true;
+    m.session.automatic_session_channel_id = session_chan.local_id;
+    const session_id = session_chan.local_id;
+
+    const agent_chan = m.session.channel_table.allocChannelKind(.AgentForward, 21, 32768, 32768).?;
+    agent_chan.state = .DataRx;
+    agent_chan.close_sent = true;
+    const agent_id = agent_chan.local_id;
+
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, session_id);
+    try expectChannelClosedForTest(&m, session_id);
+    try m.clearEvent(.{ .ChannelClosed = session_id });
+    try std.testing.expect(m.session.channel_table.findByLocalId(session_id) == null);
+    try std.testing.expect(m.session.channel_table.findByLocalId(agent_id) != null);
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, agent_id);
+    try expectAgentChannelClosedForTest(&m, agent_id);
+    try m.clearEvent(.{ .AgentChannelClosed = agent_id });
+    try expectDisconnectForTest(&m);
+}
+
+test "automatic session ends after agent channel closes before session channel" {
+    var prng = std.Random.DefaultPrng.init(47);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const session_chan = m.session.channel_table.allocChannel(22, 32768, 32768).?;
+    session_chan.state = .DataRx;
+    session_chan.close_sent = true;
+    m.session.automatic_session_channel_id = session_chan.local_id;
+    const session_id = session_chan.local_id;
+
+    const agent_chan = m.session.channel_table.allocChannelKind(.AgentForward, 23, 32768, 32768).?;
+    agent_chan.state = .DataRx;
+    agent_chan.close_sent = true;
+    const agent_id = agent_chan.local_id;
+
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, agent_id);
+    try expectAgentChannelClosedForTest(&m, agent_id);
+    try m.clearEvent(.{ .AgentChannelClosed = agent_id });
+    try std.testing.expect(m.session.channel_table.findByLocalId(agent_id) == null);
+    try std.testing.expect(m.session.channel_table.findByLocalId(session_id) != null);
+    switch (try m.getNextEvent()) {
+        .Event => return error.TestUnexpectedResult,
+        else => {},
+    }
+
+    try deliverChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, session_id);
+    try expectChannelClosedForTest(&m, session_id);
+    try m.clearEvent(.{ .ChannelClosed = session_id });
+    try expectDisconnectForTest(&m);
+}
+
 test "peer close pending during fragment discards suffix before close reply" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -4787,7 +5338,9 @@ test "peer close pending during fragment discards suffix before close reply" {
     try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
     const local_id = chan.local_id;
     try m.consumed(close_reply.len);
-    try std.testing.expect(m.session.channel_table.findByLocalId(local_id) == null);
+    try expectChannelClosedForTest(&m, local_id);
+    try std.testing.expect(m.session.channel_table.findByLocalId(local_id) != null);
+    try m.clearEvent(.{ .ChannelClosed = local_id });
 }
 
 test "local close discards window-blocked suffix after in-flight fragment" {
@@ -5535,6 +6088,8 @@ test "client records durable exit status and first terminal result wins" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(m.clearChannelExitResult(channel_id));
+    try expectChannelClosedForTest(&m, channel_id);
+    try m.clearEvent(.{ .ChannelClosed = channel_id });
 }
 
 test "client owns exit signal fields after receive buffer reuse" {
@@ -5668,6 +6223,7 @@ test "client exit result reservations provide backpressure and no-result complet
     const limits = Sshz.ResourceLimits{ .max_channels = 1 };
     var m = try SshzClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
     defer m.deinit();
+    try m.setAutoSessionEnabled(false);
 
     const first = m.session.channel_table.allocChannel(101, 32768, 32768).?;
     const first_id = first.local_id;
@@ -5683,6 +6239,8 @@ test "client exit result reservations provide backpressure and no-result complet
         .NoResult => {},
         else => return error.TestUnexpectedResult,
     }
+    try expectChannelClosedForTest(&m, first_id);
+    try m.clearEvent(.{ .ChannelClosed = first_id });
 
     const second = m.session.channel_table.allocChannel(102, 32768, 32768).?;
     try std.testing.expectError(IoError.tooManyChannels, m.session.reserveExitResult(second.local_id));

@@ -90,8 +90,10 @@ An event remains pending until cleared or decided. Repeated
 payload is processed. All slices in events (`username`, key blobs, passwords,
 commands, data, descriptions, and similar fields) are borrowed from session
 storage and become invalid when the event is cleared/accepted/rejected, on
-another state-mutating call that releases it, or at `deinit`. Copy data that
-must outlive the callback, and protect/erase copied secrets.
+another state-mutating call that releases it, or at `deinit`. In particular,
+copy an `RxData` or `RxExtendedData` payload before clearing its event if the
+application cannot consume it synchronously. Copy all other data that must
+outlive the callback, and protect/erase copied secrets.
 
 The buffer from `getChannelWriteBuffer(channel)` is also borrowed. Copy no more
 than its length, immediately call `channelWriteComplete(channel, count)`, and
@@ -129,6 +131,16 @@ PTY+exec. A PTY may merge stderr into terminal output and apply terminal output
 processing. This automatic-session behavior is pre-1.0 and unsuitable as an
 implicit production policy. Configure the intended operation before driving
 the handshake.
+
+Call `setAutoSessionEnabled(false)` before authentication for a tunnel-only
+client. Authentication then emits `Connected` without opening a session
+channel. Closing its final ordinary channel leaves the authenticated transport
+active, including while it has zero channels, so the application may later
+open another `direct-tcpip` channel. A server disconnect, transport EOF,
+explicit application shutdown, authentication failure, timeout, or fatal
+library error still ends the transport. Automatic shell/exec clients retain
+their existing session-wide `EndSession` behavior after the final ordinary
+channel closes.
 
 For an automatic shell or exec, save or query `automaticSessionChannelId()`.
 `channelExitResult(id)` returns the first valid RFC 4254 terminal result:
@@ -188,18 +200,40 @@ by connection cleanup, not acceptance or an indefinite pending event.
    Session-specific requests are rejected at the protocol boundary when their
    recipient is not a `Session` channel and never reach application callbacks.
 4. Process `RxData`/`RxExtendedData` synchronously and clear the event to
-   release the borrowed payload and permit window replenishment. Send with the
-   borrowed channel-write buffer contract above; flow control may temporarily
-   return an empty buffer or `NotReady`.
-5. `sendChannelEof` ends the local data direction after queued data.
-   `sendChannelClose` abandons unsent data and starts close exchange. After
-   close/end-session, inspect `channelExitResult` for session channels, then
-   call `clearChannelExitResult` and release every application resource bound
-   to that channel.
+   release the borrowed payload. Automatic receive-window replenishment remains
+   the default. An application that needs bounded downstream backpressure may
+   call `setAutoChannelReadCreditEnabled(false)` before any channel opens.
+   Clearing a borrowed data event then releases sshz's packet storage without
+   crediting the peer. After consuming or durably buffering bytes, call
+   `channelReadConsumed(channel_id, count)` with a positive count no greater
+   than that channel's delivered-but-uncredited bytes. Partial credit is
+   allowed. Unknown, automatic-credit, closing, and closed channels reject the
+   call; zero, over-credit, and arithmetic overflow are errors. Window adjusts
+   remain channel-specific and are scheduled round-robin with pending channel
+   output. Agent channels retain automatic credit.
+5. A client ordinary channel emits `ChannelEof(channel_id)` exactly once after
+   all earlier data events on that channel have been observed. If EOF and close
+   are both received, `ChannelEof` is observed before
+   `ChannelClosed(channel_id)`. One channel's EOF or close does not end its
+   peers.
+6. `sendChannelEof` ends the local data direction after queued data.
+   `sendChannelClose` abandons unsent data and starts close exchange.
+   `ChannelClosed` is emitted when the ordinary channel close handshake
+   completes. The channel slot remains reserved until that event is cleared;
+   clearing it permits slot reuse. Agent channels continue to use
+   `AgentChannelClosed`.
+7. After close/end-session, inspect `channelExitResult` for session channels,
+   then call `clearChannelExitResult` and release every application resource
+   bound to that channel.
 
 Reject forwarding and agent requests unless separately authorized. Validate
 resolved destinations too, preventing DNS rebinding and access to loopback,
 link-local, metadata, privileged, or internal services contrary to policy.
+
+In manual-credit mode, configure `initial_channel_window` no larger than the
+application's bounded per-channel receive storage. sshz does not add a socket
+queue or retain application payload after the borrowed receive event is
+cleared.
 
 ## Limits, deadlines, and rekey
 
@@ -228,8 +262,9 @@ around backpressure.
   configuration/clock-contract bugs. Fix configuration; do not retry a live
   session after a monotonic-clock violation.
 - `NotReady`, `cannotAcceptWrite`, `notProducing`, and `notEnoughData` normally
-  indicate pump ordering/backpressure mistakes. Correct the poll state; never
-  drop or duplicate bytes.
+  indicate pump ordering/backpressure mistakes. `InvalidChannelReadCredit` and
+  `ChannelReadCreditExceeded` identify invalid manual receive-credit calls.
+  Correct the poll/accounting state; never drop or duplicate bytes.
 - `BufferError`, malformed framing/MAC, negotiation, unexpected response,
   channel-window/packet, auth/KEX/resource, host-key-change, and
   key-lifetime errors are peer/session failures. Close and deinitialize.
