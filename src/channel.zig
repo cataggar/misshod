@@ -15,6 +15,8 @@ pub const ChannelError = error{
     ChannelPacketTooLarge,
     ReceiveWindowExceeded,
     WindowOverflow,
+    InvalidChannelReadCredit,
+    ChannelReadCreditExceeded,
 };
 
 pub const ChannelLimits = struct {
@@ -107,6 +109,9 @@ pub const Channel = struct {
     local_window_target: u32,
     local_max_packet_size: u32,
     max_buffered_data: usize,
+    automatic_read_credit: bool,
+    delivered_uncredited: u32,
+    pending_window_adjust: u32,
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
     tx_in_flight_len: usize,
@@ -148,6 +153,9 @@ pub const Channel = struct {
             .local_window_target = limits.initial_window,
             .local_max_packet_size = limits.packet_size,
             .max_buffered_data = limits.max_buffered_data,
+            .automatic_read_credit = true,
+            .delivered_uncredited = 0,
+            .pending_window_adjust = 0,
             .write_buf_nbytes = 0,
             .tx_in_flight_len = 0,
             .eof_pending = false,
@@ -192,21 +200,68 @@ pub const Channel = struct {
         self.local_window -= @intCast(len);
     }
 
+    pub fn consumeReceivedData(self: *Self, len: usize) ChannelError!void {
+        if (!self.automatic_read_credit and
+            len > std.math.maxInt(u32) - self.delivered_uncredited)
+        {
+            return error.WindowOverflow;
+        }
+        try self.consumeLocalWindow(len);
+        if (!self.automatic_read_credit) {
+            self.delivered_uncredited += @intCast(len);
+        }
+    }
+
+    pub fn queueReadCredit(self: *Self, count: usize) ChannelError!void {
+        if (count == 0 or count > std.math.maxInt(u32)) {
+            return error.InvalidChannelReadCredit;
+        }
+        const amount: u32 = @intCast(count);
+        if (amount > self.delivered_uncredited) {
+            return error.ChannelReadCreditExceeded;
+        }
+        if (amount > std.math.maxInt(u32) - self.pending_window_adjust) {
+            return error.WindowOverflow;
+        }
+        if (self.local_window > self.local_window_target) {
+            return error.WindowOverflow;
+        }
+        const available = self.local_window_target - self.local_window;
+        if (self.pending_window_adjust > available or
+            amount > available - self.pending_window_adjust)
+        {
+            return error.WindowOverflow;
+        }
+        self.delivered_uncredited -= amount;
+        self.pending_window_adjust += amount;
+    }
+
     pub fn adjustPeerWindow(self: *Self, amount: u32, maximum: u32) ChannelError!void {
         if (self.peer_window > maximum or amount > maximum - self.peer_window)
             return error.WindowOverflow;
         self.peer_window += amount;
     }
 
-    /// Returns true if local_window has dropped below the replenish threshold.
+    /// Returns true when automatic replenishment is due or manual credit is queued.
     pub fn needsWindowAdjust(self: *const Self) bool {
-        return self.local_window == 0 or
-            self.local_window < self.local_window_target / 2;
+        if (!self.automatic_read_credit) return self.pending_window_adjust != 0;
+        return self.local_window == 0 or self.local_window < self.local_window_target / 2;
     }
 
-    /// Returns the number of bytes to add to restore the advertised receive window.
+    /// Returns the automatic replenishment or application-credited byte count.
     pub fn windowAdjustAmount(self: *const Self) u32 {
+        if (!self.automatic_read_credit) return self.pending_window_adjust;
         return self.local_window_target - self.local_window;
+    }
+
+    pub fn applyWindowAdjust(self: *Self, amount: u32) void {
+        std.debug.assert(amount != 0);
+        std.debug.assert(amount <= self.local_window_target - self.local_window);
+        self.local_window += amount;
+        if (!self.automatic_read_credit) {
+            std.debug.assert(amount <= self.pending_window_adjust);
+            self.pending_window_adjust -= amount;
+        }
     }
 };
 
@@ -365,7 +420,29 @@ pub const ChannelTable = struct {
                     ch.control_in_flight == null and
                     ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
                 const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
-                if (tx_ready or control_ready or terminal_close_ready or (ch.close_received and !ch.close_sent)) {
+                const window_adjust_ready = ch.remote_id_known and ch.state == .DataRx and
+                    !ch.eof_received and !ch.close_pending and !ch.close_sent and !ch.close_received and
+                    ch.needsWindowAdjust();
+                if (tx_ready or control_ready or terminal_close_ready or window_adjust_ready or
+                    (ch.close_received and !ch.close_sent))
+                {
+                    self.last_serviced_slot = slot_idx;
+                    return ch;
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn findNextWindowAdjust(self: *Self) ?*Channel {
+        var i: usize = 0;
+        while (i < MaxChannels) : (i += 1) {
+            const slot_idx = (self.last_serviced_slot + 1 + i) % MaxChannels;
+            if (self.channels[slot_idx]) |*ch| {
+                if (ch.remote_id_known and (ch.state == .Data or ch.state == .DataRx) and
+                    !ch.eof_received and !ch.close_pending and !ch.close_sent and !ch.close_received and
+                    ch.needsWindowAdjust())
+                {
                     self.last_serviced_slot = slot_idx;
                     return ch;
                 }
@@ -705,6 +782,40 @@ test "windowAdjustAmount replenishes advertised window" {
     // After applying the adjust, window should match the advertised window.
     ch.local_window = ch.local_window_target;
     try std.testing.expectEqual(Protocol.MaxChannelDataLen, ch.local_window);
+}
+
+test "manual read credit rejects invalid excessive and overflowing counts" {
+    var ch = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 8,
+        .packet_size = 4,
+    });
+    ch.automatic_read_credit = false;
+    try ch.consumeReceivedData(4);
+    try std.testing.expectEqual(@as(u32, 4), ch.delivered_uncredited);
+    try std.testing.expectError(error.InvalidChannelReadCredit, ch.queueReadCredit(0));
+    try std.testing.expectError(error.ChannelReadCreditExceeded, ch.queueReadCredit(5));
+    try std.testing.expectEqual(@as(u32, 4), ch.delivered_uncredited);
+    try std.testing.expectEqual(@as(u32, 0), ch.pending_window_adjust);
+
+    ch.local_window = ch.local_window_target;
+    try std.testing.expectError(error.WindowOverflow, ch.queueReadCredit(1));
+    try std.testing.expectEqual(@as(u32, 4), ch.delivered_uncredited);
+    try std.testing.expectEqual(@as(u32, 0), ch.pending_window_adjust);
+}
+
+test "manual read credit supports partial consumption" {
+    var ch = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 8,
+        .packet_size = 4,
+    });
+    ch.automatic_read_credit = false;
+    try ch.consumeReceivedData(4);
+    try ch.queueReadCredit(2);
+    try std.testing.expectEqual(@as(u32, 2), ch.delivered_uncredited);
+    try std.testing.expectEqual(@as(u32, 2), ch.pending_window_adjust);
+    ch.applyWindowAdjust(ch.windowAdjustAmount());
+    try std.testing.expectEqual(@as(u32, 6), ch.local_window);
+    try std.testing.expectEqual(@as(u32, 0), ch.pending_window_adjust);
 }
 
 test "EofWrite is a runnable state" {

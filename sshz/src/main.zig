@@ -651,6 +651,8 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .ChannelOpened,
                             .ChannelOpenFailure,
+                            .ChannelEof,
+                            .ChannelClosed,
                             .TcpipForwardSuccess,
                             .TcpipForwardFailure,
                             .CancelTcpipForwardSuccess,

@@ -571,6 +571,10 @@ pub const SshzClientEventCodes = union(enum) {
     Connected,
     ChannelOpened: u32,
     ChannelOpenFailure: ChannelOpenFailure,
+    /// The peer ended its data direction for this non-agent channel.
+    ChannelEof: u32,
+    /// The close handshake completed. Clearing this event releases the slot.
+    ChannelClosed: u32,
     ChannelOpenRequest: ChannelOpenRequestEvent,
     TcpipForwardSuccess: TcpipForwardSuccess,
     TcpipForwardFailure: TcpipForwardFailure,
@@ -1265,6 +1269,29 @@ pub fn SshzImpl(role: Role) type {
                                 if (comptime role == .Client) {
                                     switch (eventCode) {
                                         .CheckHostKey => return IoError.badClearEvent,
+                                        .ChannelClosed => |channel_id| {
+                                            const end_session = try self.session.releaseClosedChannel(channel_id);
+                                            self.session.setIoSessionState(iotype.next_state);
+                                            self.iostate_wr = .Idle;
+                                            self.scrubReceiveBuffers();
+                                            if (end_session) {
+                                                self.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
+                                            } else {
+                                                try self.advance();
+                                            }
+                                            return;
+                                        },
+                                        .AgentChannelClosed => {
+                                            self.session.setIoSessionState(iotype.next_state);
+                                            self.iostate_wr = .Idle;
+                                            self.scrubReceiveBuffers();
+                                            if (self.session.shouldEndAfterChannelRelease()) {
+                                                self.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
+                                            } else {
+                                                try self.advance();
+                                            }
+                                            return;
+                                        },
                                         else => {},
                                     }
                                 }
@@ -1450,7 +1477,14 @@ pub fn SshzImpl(role: Role) type {
                         self.wr_nbytes = 0;
                         self.wr_off = 0;
                         switch (iotype.next_state) {
-                            .WriteCompletePreserveState => {},
+                            .WriteCompletePreserveState => {
+                                if (role == .Client) {
+                                    self.session.completeChannelWindowAdjust(self) catch |err| {
+                                        self.failClosed();
+                                        return err;
+                                    };
+                                }
+                            },
                             .ChannelWriteComplete => |channel_id| {
                                 self.session.completeChannelWrite(channel_id, self) catch |err| {
                                     self.failClosed();
@@ -1682,7 +1716,12 @@ pub fn SshzImpl(role: Role) type {
         pub fn advance(self: *Self) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             errdefer self.failClosed();
-            if (role == .Client) _ = try self.session.flushPendingWindowChange(self);
+            if (role == .Client) {
+                _ = try self.session.flushPendingWindowChange(self);
+                // Receive credit may be queued while another packet owns the
+                // write side, even though a packet-header read is still active.
+                _ = try self.session.flushPendingChannelWindowAdjust(self);
+            }
             const inkeys = switch (role) {
                 .Client => &self.session.keydata.s2c,
                 .Server => &self.session.keydata.c2s,
@@ -1758,6 +1797,24 @@ pub fn SshzImpl(role: Role) type {
             }
         }
 
+        /// Returns receive-window credit for an ordinary client channel.
+        ///
+        /// This is valid only after automatic channel read credit has been
+        /// disabled and no more than the bytes delivered through borrowed
+        /// `RxData` or `RxExtendedData` events may be credited.
+        pub fn channelReadConsumed(self: *Self, channel_id: u32, count: usize) SshzError!void {
+            return switch (role) {
+                .Client => {
+                    self.session.channelReadConsumed(channel_id, count, self) catch |err| {
+                        self.latchKeyLifetimeError(err);
+                        return err;
+                    };
+                    try self.advance();
+                },
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         pub fn openSessionChannel(self: *Self) SshzError!u32 {
             try self.gateApplicationInitiation();
             return switch (role) {
@@ -1810,6 +1867,17 @@ pub fn SshzImpl(role: Role) type {
         pub fn setAutoSessionEnabled(self: *Self, enabled: bool) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoSessionEnabled(enabled),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Controls automatic receive-window replenishment for ordinary channels.
+        ///
+        /// Disable this before opening channels to return credit explicitly with
+        /// `channelReadConsumed`. Agent channels retain automatic credit.
+        pub fn setAutoChannelReadCreditEnabled(self: *Self, enabled: bool) SshzError!void {
+            return switch (role) {
+                .Client => try self.session.setAutoChannelReadCreditEnabled(enabled),
                 .Server => IoError.UnimplementedService,
             };
         }
@@ -2940,6 +3008,20 @@ test "SshzClientEventCodes agent forwarding variants" {
     const closed_evt: SshzClientEventCodes = .{ .AgentChannelClosed = 3 };
     switch (closed_evt) {
         .AgentChannelClosed => |channel| try std.testing.expectEqual(@as(u32, 3), channel),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "SshzClientEventCodes ordinary channel lifecycle variants" {
+    const eof_event: SshzClientEventCodes = .{ .ChannelEof = 5 };
+    switch (eof_event) {
+        .ChannelEof => |channel| try std.testing.expectEqual(@as(u32, 5), channel),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const closed_event: SshzClientEventCodes = .{ .ChannelClosed = 7 };
+    switch (closed_event) {
+        .ChannelClosed => |channel| try std.testing.expectEqual(@as(u32, 7), channel),
         else => return error.TestUnexpectedResult,
     }
 }
