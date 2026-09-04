@@ -1796,6 +1796,17 @@ pub const Session = struct {
         _ = try self.startPendingChannelControl(chan, sshz, &self.keydata.c2s);
     }
 
+    pub fn channelEofFlushed(self: *Self, channel_id: u32) SshzError!bool {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.kind != .Session or chan.state == .Closed or
+            chan.close_pending or chan.close_sent or chan.close_received)
+        {
+            return IoError.UnexpectedResponse;
+        }
+        if (!chan.remote_id_known) return false;
+        return chan.eofFlushed();
+    }
+
     pub fn sendChannelClose(self: *Self, channel_id: u32, sshz: *SshzClient) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
         if (chan.close_sent or chan.close_pending) return;
@@ -4337,6 +4348,7 @@ test "unconfirmed client channel defers close until remote id is known" {
         },
         else => return error.TestUnexpectedResult,
     }
+
     try m.clearEvent(.{ .ChannelOpened = channel_id });
 
     const close_packet = try m.peek(Protocol.MaxSSHPacket);
@@ -4344,6 +4356,24 @@ test "unconfirmed client channel defers close until remote id is known" {
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
     try std.testing.expectEqual(@as(u32, 77), try close_reader.readU32());
     try std.testing.expect(pending.remote_id_known);
+}
+
+test "unconfirmed client channel reports queued EOF as not flushed" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const existing = m.session.channel_table.allocChannel(0, 1000, 1000).?;
+    existing.state = .DataRx;
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+    const channel_id = try m.openSessionChannel();
+    const pending = m.session.channel_table.findByLocalId(channel_id).?;
+    try std.testing.expect(!pending.remote_id_known);
+
+    try m.sendChannelEof(channel_id);
+    try std.testing.expect(pending.eof_pending);
+    try std.testing.expect(!(try m.channelEofFlushed(channel_id)));
 }
 
 test "handlePacket: SSH_MSG_DEBUG with always_display=true" {
@@ -5165,9 +5195,11 @@ test "client direct write retains suffix across peer packet and window limits" {
     try std.testing.expectEqual(@as(usize, 1000), chan.tx_in_flight_len);
     try std.testing.expectEqual(@as(usize, 0), (try m.getChannelWriteBuffer(chan.local_id)).len);
     try std.testing.expectError(IoError.cannotAcceptWrite, m.channelWriteComplete(chan.local_id, 1));
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
     try m.sendChannelEof(chan.local_id);
     try std.testing.expect(chan.eof_pending);
     try std.testing.expect(!chan.eof_sent);
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
 
     var inbound_payload_buf: [32]u8 = undefined;
     var inbound_payload = BufferWriter.init(&inbound_payload_buf, 0);
@@ -5184,6 +5216,7 @@ test "client direct write retains suffix across peer packet and window limits" {
     received_len += try consumeProducedChannelDataForTest(&m, &received, received_len);
     try std.testing.expectEqual(@as(usize, 1000), received_len);
     try std.testing.expectEqual(@as(usize, 1500), chan.write_buf_nbytes);
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
 
     const inbound_event = try m.getNextEvent();
     switch (inbound_event) {
@@ -5232,7 +5265,10 @@ test "client direct write retains suffix across peer packet and window limits" {
     try std.testing.expectEqual(chan.remote_id, try eof_reader.readU32());
     try std.testing.expect(chan.eof_sent);
     try std.testing.expect(!chan.eof_pending);
+    try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
     try m.consumed(eof_packet.len);
+    try std.testing.expect(try m.channelEofFlushed(chan.local_id));
+    try std.testing.expectError(IoError.UnexpectedResponse, m.channelEofFlushed(9999));
     try std.testing.expectEqual(@as(usize, 0), (try m.getChannelWriteBuffer(chan.local_id)).len);
     try std.testing.expectError(IoError.UnexpectedResponse, m.channelWriteComplete(chan.local_id, 1));
 }

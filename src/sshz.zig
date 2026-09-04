@@ -2153,6 +2153,15 @@ pub fn SshzImpl(role: Role) type {
             try self.advance();
         }
 
+        /// Reports whether a requested channel EOF and all preceding data have
+        /// been written to the transport.
+        pub fn channelEofFlushed(self: *Self, channel_id: u32) SshzError!bool {
+            return switch (role) {
+                .Client => self.session.channelEofFlushed(channel_id),
+                .Server => self.session.channelEofFlushed(channel_id),
+            };
+        }
+
         pub fn sendChannelClose(self: *Self, channel_id: u32) SshzError!void {
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
