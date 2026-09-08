@@ -10,6 +10,7 @@ ordered byte stream.
 - Client keyboard-interactive plus client/server public-key, password, and none authentication
 - Multiple channels, sessions, port forwarding, and agent forwarding
 - Rekeying, delayed compression, resource limits, and deadline enforcement
+- Explicit acknowledged keepalives with owned request tokens and transport-flush accounting
 - Interoperability coverage with OpenSSH, Dropbear, and libssh
 
 The authoritative algorithm list and negotiation rules are in the

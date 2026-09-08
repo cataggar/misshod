@@ -165,6 +165,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     production_client_mod.addImport("sshz", mod);
+    production_client_mod.addAnonymousImport("production_test_host_key", .{
+        .root_source_file = b.path("testserver/id_ed25519_passwordless"),
+    });
     linkZlib(b, production_client_mod);
     const production_client = b.addExecutable(.{
         .name = "sshz-production-client-example",
@@ -252,4 +255,3 @@ pub fn build(b: *std.Build) void {
     const interop_step = b.step("interop", "Run OpenSSH/libssh interoperability tests");
     interop_step.dependOn(&interop_cmd.step);
 }
-

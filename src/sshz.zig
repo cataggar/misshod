@@ -47,6 +47,7 @@ pub const IoError = error{
     InvalidChannelParameters,
     KeyLifetimeExceeded,
     SessionTerminated,
+    InvalidKeepaliveToken,
 };
 
 pub const ResourceLimitConfigError = error{
@@ -638,6 +639,41 @@ pub const TcpipForwardFailure = struct {
     bind_port: u32,
 };
 
+/// Value-owned identifier, valid only with the client that issued it.
+/// Tokens are never reused during that client's lifetime.
+pub const KeepaliveToken = struct {
+    id: u64,
+};
+
+pub const KeepaliveTransmission = enum {
+    /// Accepted locally, but not yet framed. May wait behind output or rekey.
+    Queued,
+    /// Framed; some or none of its bytes have been consumed by the caller.
+    Emitting,
+    /// Every byte of the request has passed through `consumed`.
+    /// A buffering transport may still have unsent bytes.
+    HandedToTransport,
+};
+
+/// Either reply proves peer responsiveness, not remote application progress.
+pub const KeepaliveReply = enum { Success, Failure };
+
+pub const KeepaliveOutcome = union(enum) {
+    Pending,
+    Acknowledged: KeepaliveReply,
+    Cancelled,
+    Disconnected,
+};
+
+/// Contains no borrowed storage; copies survive event clearing and teardown.
+pub const KeepaliveStatus = struct {
+    token: KeepaliveToken,
+    transmission: KeepaliveTransmission = .Queued,
+    /// Set only by the caller through `markKeepaliveFlushed`, never by enqueue.
+    transport_flushed: bool = false,
+    outcome: KeepaliveOutcome = .Pending,
+};
+
 pub const DirectTcpipOpen = struct {
     host: []const u8,
     port: u32,
@@ -1217,6 +1253,7 @@ pub fn SshzImpl(role: Role) type {
 
         // for session use
         pub fn requestEvent(self: *Self, code: eventCodeType(role), next_state: Protocol.IoSessionState) void {
+            if (role == .Client and code == .EndSession) self.session.endGlobalRequests();
             self.iostate_wr = .{ .Active = .{
                 .action = .{ .Eventing = code },
                 .next_state = next_state,
@@ -1385,7 +1422,7 @@ pub fn SshzImpl(role: Role) type {
                         .Producing => |block_size| {
                             _ = block_size;
                             TRACE(.Debug, "getIoReq Producing wr_nbytes={d}", .{self.wr_nbytes});
-                            can_produce.* = self.wr_nbytes;
+                            can_produce.* = self.wr_nbytes - self.wr_off;
                         },
                         else => {},
                     }
@@ -1438,11 +1475,7 @@ pub fn SshzImpl(role: Role) type {
 
             const bytes_remaining = self.wr_nbytes - self.wr_off;
 
-            if (bytes_remaining < nbytes) {
-                return self.iobuf_wr[self.wr_off .. self.wr_off + bytes_remaining];
-            } else {
-                return self.iobuf_wr[self.wr_off..self.wr_nbytes];
-            }
+            return self.iobuf_wr[self.wr_off .. self.wr_off + @min(nbytes, bytes_remaining)];
         }
 
         pub fn consumed(self: *Self, nbytes: usize) SshzError!void {
@@ -1477,6 +1510,14 @@ pub fn SshzImpl(role: Role) type {
                         self.wr_nbytes = 0;
                         self.wr_off = 0;
                         switch (iotype.next_state) {
+                            .GlobalRequestWriteComplete => {
+                                if (role == .Client) {
+                                    self.session.completeGlobalRequestWrite() catch |err| {
+                                        self.failClosed();
+                                        return err;
+                                    };
+                                }
+                            },
                             .WriteCompletePreserveState => {
                                 if (role == .Client) {
                                     self.session.completeChannelWindowAdjust(self) catch |err| {
@@ -1631,6 +1672,7 @@ pub fn SshzImpl(role: Role) type {
                     }
                 },
                 .WriteCompletePreserveState => return IoError.UnexpectedResponse,
+                .GlobalRequestWriteComplete => return IoError.UnexpectedResponse,
                 .ChannelWriteComplete => return IoError.UnexpectedResponse,
                 .ChannelControlComplete => return IoError.UnexpectedResponse,
                 .ReadPktHdr => {
@@ -1705,6 +1747,7 @@ pub fn SshzImpl(role: Role) type {
                 // Write-requiring states need write side idle
                 .VersionWrite => self.iostate_wr == .Idle,
                 .WriteCompletePreserveState => false,
+                .GlobalRequestWriteComplete => false,
                 .ChannelWriteComplete => false,
                 .ChannelControlComplete => false,
                 // Processing states
@@ -1729,6 +1772,7 @@ pub fn SshzImpl(role: Role) type {
             while (true) {
                 self.updateLocalRekeyPending(null);
                 _ = self.maybeStartLocalRekey();
+                if (role == .Client) _ = try self.session.flushPendingKeepalive(self);
                 if (!self.canProcessIoSessionState()) break;
                 const prev_io_state = self.session.ioSessionState;
                 const prev_rd = self.iostate_rd;
@@ -1942,6 +1986,65 @@ pub fn SshzImpl(role: Role) type {
                     self.latchKeyLifetimeError(err);
                     return err;
                 },
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Explicitly queues `keepalive@openssh.com` with want_reply=true.
+        ///
+        /// Shares the one outstanding global-request slot with forwarding.
+        /// Returns ResourceLimitExceeded if that slot or the previous keepalive
+        /// result is occupied. Accepted requests may wait for output or rekey;
+        /// no clock, timeout, retry, or automatic probing policy is installed.
+        pub fn requestKeepalive(self: *Self) SshzError!KeepaliveToken {
+            if (self.terminated) return IoError.SessionTerminated;
+            return switch (role) {
+                .Client => {
+                    const token = try self.session.queueKeepalive();
+                    try self.advance();
+                    return token;
+                },
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Returns an owned snapshot, retained until `clearKeepalive`.
+        pub fn keepaliveStatus(self: *const Self, token: KeepaliveToken) SshzError!KeepaliveStatus {
+            return switch (role) {
+                .Client => self.session.keepaliveStatus(token),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Confirms an application-owned transport flush, not peer receipt.
+        ///
+        /// Call only after HandedToTransport and after the underlying stream
+        /// accepted all bytes through this request. A direct socket pump may
+        /// call this after its final successful send/consumed pair. A buffering
+        /// adapter must record that byte-stream boundary and wait for its own
+        /// queue to flush through it. Start a reply deadline only at that point.
+        pub fn markKeepaliveFlushed(self: *Self, token: KeepaliveToken) SshzError!void {
+            return switch (role) {
+                .Client => self.session.markKeepaliveFlushed(token),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Abandons observation. A framed request still drains and reserves the
+        /// global-request slot until its reply arrives or the session ends.
+        /// For a late-reply grace period, leave the request Pending instead.
+        pub fn cancelKeepalive(self: *Self, token: KeepaliveToken) SshzError!void {
+            return switch (role) {
+                .Client => self.session.cancelKeepalive(token),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Releases a terminal snapshot. Pending returns NotReady. Clearing a
+        /// cancelled result never releases an outstanding on-wire reply slot.
+        pub fn clearKeepalive(self: *Self, token: KeepaliveToken) SshzError!void {
+            return switch (role) {
+                .Client => self.session.clearKeepalive(token),
                 .Server => IoError.UnimplementedService,
             };
         }
@@ -3785,7 +3888,7 @@ fn largeChannelTestByte(packet_index: u8, byte_index: usize) u8 {
     return @truncate(value >> 24);
 }
 
-test "full handshake round-trip handles multiple large compressed channel packets" {
+test "full handshake handles large compressed channel packets and keepalive queued through rekey" {
     const privkey = @import("privkey.zig");
     const limits = ResourceLimits{ .key_lifetime = .{
         .rekey_after_encrypted_packets = 10,
@@ -3821,6 +3924,8 @@ test "full handshake round-trip handles multiple large compressed channel packet
     var receive_epochs: [12]u64 = .{0} ** 12;
     var initial_session_id: ?[Protocol.hash_algo.digest_length]u8 = null;
     var accepted_host_fingerprint: ?[Protocol.hash_algo.digest_length]u8 = null;
+    var keepalive_token: ?KeepaliveToken = null;
+    var keepalive_acknowledged = false;
     const packet_lengths = [_]usize{
         12_000, 6_000, 3_000, 3_000, 3_000, 3_000,
         3_000,  3_000, 3_000, 3_000, 3_000, 3_000,
@@ -3833,18 +3938,28 @@ test "full handshake round-trip handles multiple large compressed channel packet
     while (steps < 4000) : (steps += 1) {
         if (client_packets_received == packet_lengths.len and
             receive_epochs[packet_lengths.len - 1] > receive_epochs[0] and
-            !client.session.is_rekeying and !server.session.is_rekeying)
+            !client.session.is_rekeying and !server.session.is_rekeying and
+            keepalive_acknowledged)
             break;
 
         for (endpoints) |ep| {
             if (ep == .client_ep) {
+                if (connected_client and keepalive_token == null and
+                    client.keyLifetimeStatus().rekey_in_progress)
+                {
+                    keepalive_token = try client.requestKeepalive();
+                    try std.testing.expectEqual(
+                        KeepaliveTransmission.Queued,
+                        (try client.keepaliveStatus(keepalive_token.?)).transmission,
+                    );
+                }
                 const cev = client.getNextEvent() catch continue;
                 switch (cev) {
                     .ReadyToProduce, .ReadyToConsumeAndProduce => {
-                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        const data = try client.peek(31);
                         @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
                         c2s_len += data.len;
-                        client.consumed(data.len) catch {};
+                        try client.consumed(data.len);
                     },
                     .ReadyToConsume => |n| {
                         if (s2c_len > 0) {
@@ -3888,6 +4003,17 @@ test "full handshake round-trip handles multiple large compressed channel packet
                             client.clearEvent(code) catch {};
                         },
                     },
+                }
+                if (keepalive_token) |token| {
+                    const status = try client.keepaliveStatus(token);
+                    // c2s_buf is still a caller-owned unsent queue. Handoff
+                    // alone must not claim a transport flush.
+                    try std.testing.expect(!status.transport_flushed);
+                    if (status.outcome == .Acknowledged) {
+                        try std.testing.expectEqual(KeepaliveReply.Failure, status.outcome.Acknowledged);
+                        try std.testing.expectEqual(KeepaliveTransmission.HandedToTransport, status.transmission);
+                        keepalive_acknowledged = true;
+                    }
                 }
             } else {
                 const sev = server.getNextEvent() catch continue;
@@ -3943,6 +4069,7 @@ test "full handshake round-trip handles multiple large compressed channel packet
 
     try std.testing.expect(connected_client);
     try std.testing.expect(connected_server);
+    try std.testing.expect(keepalive_acknowledged);
     try std.testing.expectEqual(@as(u8, packet_lengths.len), client_packets_received);
     try std.testing.expect(receive_epochs[0] >= 1);
     try std.testing.expect(receive_epochs[packet_lengths.len - 1] > receive_epochs[0]);
