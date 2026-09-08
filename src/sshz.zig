@@ -1512,7 +1512,7 @@ pub fn SshzImpl(role: Role) type {
                         switch (iotype.next_state) {
                             .GlobalRequestWriteComplete => {
                                 if (role == .Client) {
-                                    self.session.completeGlobalRequestWrite() catch |err| {
+                                    self.session.completeGlobalRequestWrite(self) catch |err| {
                                         self.failClosed();
                                         return err;
                                     };

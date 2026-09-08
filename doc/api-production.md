@@ -205,7 +205,8 @@ queue as a successful send. An acknowledgement can arrive before an adapter
 reports the flush; it still belongs to the same token.
 
 The production client example's opt-in keepalive test exercises its real
-`pumpOnce` with partial direct-transport writes and explicit flush marking,
+`pumpOnce` with partial direct-transport writes, explicit flush marking, and
+EOF/CLOSE queued behind a cancelled probe without further peer input, all
 without sockets or a remote server.
 
 ### Ordering, cancellation, and token lifetime
@@ -215,6 +216,10 @@ outstanding reply-requesting global request. A second request returns
 `ResourceLimitExceeded`; the caller may wait and retry without terminating
 the session for this documented local contention case. Existing forwarding
 events and payloads remain unchanged.
+
+Waiting for a keepalive reply does not gate deferred channel output. Queued
+EOF/CLOSE and other channel writes resume after the global request's handoff,
+subject to rekey gating and processing any already-received packet first.
 
 After an acknowledgement, use `clearKeepalive(token)` to release the retained
 result before requesting another keepalive. Clearing a `Pending` result

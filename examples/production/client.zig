@@ -307,7 +307,7 @@ test "production client pump is compile-checked without network I/O" {
     );
 }
 
-test "production pump explicitly observes keepalive after partial direct transport writes" {
+fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
     const Loopback = struct {
         // Model stream-accepted bytes waiting for the peer to read, not an
         // adapter's unsent output queue.
@@ -315,6 +315,8 @@ test "production pump explicitly observes keepalive after partial direct transpo
         to_server_len: usize = 0,
         to_client: [16384]u8 = undefined,
         to_client_len: usize = 0,
+        bytes_written: usize = 0,
+        bytes_read: usize = 0,
 
         fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
             return true;
@@ -334,6 +336,7 @@ test "production pump explicitly observes keepalive after partial direct transpo
             @memcpy(destination[0..count], self.to_client[0..count]);
             std.mem.copyForwards(u8, &self.to_client, self.to_client[count..self.to_client_len]);
             self.to_client_len -= count;
+            self.bytes_read += count;
             return count;
         }
 
@@ -342,6 +345,7 @@ test "production pump explicitly observes keepalive after partial direct transpo
             const count = @min(7, bytes.len, self.to_server.len - self.to_server_len);
             @memcpy(self.to_server[self.to_server_len..][0..count], bytes[0..count]);
             self.to_server_len += count;
+            self.bytes_written += count;
             return count;
         }
 
@@ -380,6 +384,11 @@ test "production pump explicitly observes keepalive after partial direct transpo
     var scratch: [64]u8 = undefined;
     var token: ?sshz.KeepaliveToken = null;
     var saw_partial = false;
+    var command_requested = false;
+    var shutdown_queued = false;
+    var handoff_written: ?usize = null;
+    var control_bytes: usize = 0;
+    var reads_before_probe: usize = 0;
     for (0..2000) |step| {
         switch (try server.getNextEvent()) {
             .ReadyToConsume => |n| {
@@ -400,22 +409,61 @@ test "production pump explicitly observes keepalive after partial direct transpo
             .Event => |event| switch (event) {
                 .UserAuth => try server.decideUserAuth(.Allow),
                 .ChannelOpenRequest => |request| try server.acceptChannelOpen(request.channel),
-                .Connected, .ChannelRequest => try server.clearEvent(event),
+                .Connected => try server.clearEvent(event),
+                .ChannelRequest => |request| {
+                    if (request.request == .Exec) command_requested = true;
+                    try server.clearEvent(event);
+                },
                 else => return error.UnexpectedServerEvent,
             },
         }
         _ = try pumpOnce(&client, &config, transport, &scratch, .{
-            .readable = loopback.to_client_len != 0,
+            .readable = loopback.to_client_len != 0 and (shutdown == null or token == null),
             .writable = loopback.to_server_len < loopback.to_server.len,
         }, step);
         if (token) |id| {
             var status = try client.keepaliveStatus(id);
             if (status.transmission == .Emitting) saw_partial = true;
+            if (shutdown) |control| {
+                if (status.transmission == .Emitting and !shutdown_queued) {
+                    const channel = client.automaticSessionChannelId().?;
+                    switch (control) {
+                        .Eof => try client.sendChannelEof(channel),
+                        .Close => try client.sendChannelClose(channel),
+                    }
+                    try client.cancelKeepalive(id);
+                    shutdown_queued = true;
+                    status = try client.keepaliveStatus(id);
+                }
+            }
             if (status.transmission == .HandedToTransport and !status.transport_flushed) {
                 // This adapter writes directly to the peer, without an unsent
                 // queue. Buffered adapters must wait for their own watermark.
                 try client.markKeepaliveFlushed(id);
                 status = try client.keepaliveStatus(id);
+            }
+            if (shutdown) |control| {
+                if (status.transmission == .HandedToTransport) {
+                    try std.testing.expect(shutdown_queued);
+                    try std.testing.expect(status.outcome == .Cancelled);
+                    try std.testing.expectEqual(reads_before_probe, loopback.bytes_read);
+                    if (handoff_written) |written| {
+                        if (loopback.bytes_written - written == control_bytes) {
+                            if (control == .Eof) {
+                                try std.testing.expect(try client.channelEofFlushed(client.automaticSessionChannelId().?));
+                            }
+                            try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+                            return;
+                        }
+                    } else {
+                        const next = try client.getNextEvent();
+                        try std.testing.expect(next == .ReadyToConsumeAndProduce);
+                        control_bytes = next.ReadyToConsumeAndProduce.produce;
+                        try std.testing.expect(control_bytes > 0);
+                        handoff_written = loopback.bytes_written;
+                    }
+                }
+                continue;
             }
             if (status.outcome == .Acknowledged) {
                 try std.testing.expect(saw_partial);
@@ -424,9 +472,19 @@ test "production pump explicitly observes keepalive after partial direct transpo
                 try client.clearKeepalive(id);
                 return;
             }
-        } else if (client.isActive() and client.automaticSessionChannelId() != null) {
+        } else if (command_requested and client.isActive() and client.automaticSessionChannelId() != null) {
             token = try client.requestKeepalive();
+            reads_before_probe = loopback.bytes_read;
         }
     }
     return error.KeepaliveNotAcknowledged;
+}
+
+test "production pump explicitly observes keepalive after partial direct transport writes" {
+    try exerciseProductionKeepalive(null);
+}
+
+test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {
+    try exerciseProductionKeepalive(.Eof);
+    try exerciseProductionKeepalive(.Close);
 }

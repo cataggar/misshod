@@ -1481,7 +1481,7 @@ pub const Session = struct {
         return true;
     }
 
-    pub fn completeGlobalRequestWrite(self: *Self) SshzError!void {
+    pub fn completeGlobalRequestWrite(self: *Self, sshz: *SshzClient) SshzError!void {
         const pending = if (self.pending_global_request) |*request|
             request
         else
@@ -1491,6 +1491,11 @@ pub const Session = struct {
         if (pending.kind == .Keepalive) {
             if (self.keepalive) |*status| status.transmission = .HandedToTransport;
         }
+        const received_packet_pending = switch (self.ioSessionState) {
+            .ReadPktCompletion => true,
+            else => false,
+        };
+        if (!received_packet_pending) _ = try self.dispatchDeferredChannelWrite(sshz);
     }
 
     pub fn requestRemoteForward(self: *Self, sshz: *SshzClient, bind_address: []const u8, bind_port: u32) SshzError!void {
@@ -4515,6 +4520,111 @@ test "global-request completion preserves partially received packets" {
             try std.testing.expectEqual(@as(u32, 22), event.TcpipForwardFailure.bind_port);
             try client.clearEvent(event);
         }
+    }
+}
+
+test "keepalive handoff dispatches queued EOF and CLOSE without a reply" {
+    for ([_]bool{ false, true }) |partial_body| {
+        for ([_]ChannelControl{ .Eof, .Close }) |control| {
+            for ([_]bool{ false, true }) |cancelled| {
+                var prng = std.Random.DefaultPrng.init(56);
+                var client = try keepaliveTestClient(prng.random());
+                defer client.deinit();
+                const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+                channel.state = .DataRx;
+                var packet: [64]u8 = undefined;
+                const len = buildUnencryptedPacket(&packet, &.{ @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE), 0, 0, 0, 1, 'x' });
+                if (partial_body) {
+                    try feedKeepaliveTestBytes(&client, packet[0 .. Protocol.sizeof_PktHdr + 1]);
+                } else {
+                    _ = try client.getNextEvent();
+                }
+
+                const token = try client.requestKeepalive();
+                const keepalive_len = (try client.peek(Protocol.MaxSSHPacket)).len;
+                try client.consumed(1);
+                switch (control) {
+                    .Eof => try client.sendChannelEof(channel.local_id),
+                    .Close => try client.sendChannelClose(channel.local_id),
+                }
+                if (cancelled) try client.cancelKeepalive(token);
+                const before = (try client.getNextEvent()).ReadyToConsumeAndProduce;
+                try std.testing.expectEqual(keepalive_len - 1, before.produce);
+                try consumeKeepaliveTestPacket(&client);
+
+                // No peer bytes are delivered between queuing control and
+                // this handoff. The public pump must expose the next packet.
+                const after = try client.getNextEvent();
+                try std.testing.expect(after == .ReadyToConsumeAndProduce);
+                try std.testing.expectEqual(before.consume, after.ReadyToConsumeAndProduce.consume);
+                var rdr = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+                try std.testing.expectEqual(@intFromEnum(switch (control) {
+                    .Eof => Protocol.MsgId.SSH_MSG_CHANNEL_EOF,
+                    .Close => Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE,
+                }), try rdr.readU8());
+                try std.testing.expectEqual(@as(u32, 42), try rdr.readU32());
+                try std.testing.expectEqual(rdr.payload.len, rdr.off);
+                const status = try client.keepaliveStatus(token);
+                try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, status.transmission);
+                try std.testing.expect(if (cancelled) status.outcome == .Cancelled else status.outcome == .Pending);
+                if (control == .Eof) try std.testing.expect(!try client.channelEofFlushed(channel.local_id));
+                try client.consumed(1);
+                try consumeKeepaliveTestPacket(&client);
+                if (control == .Eof) try std.testing.expect(try client.channelEofFlushed(channel.local_id));
+                if (partial_body) try feedKeepaliveTestBytes(&client, packet[Protocol.sizeof_PktHdr + 1 .. len]);
+                try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+            }
+        }
+    }
+}
+
+test "keepalive handoff processes a received disconnect before deferred channel control" {
+    var prng = std.Random.DefaultPrng.init(57);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+    channel.state = .DataRx;
+    _ = try client.getNextEvent();
+    const token = try client.requestKeepalive();
+    try client.consumed(1);
+    try client.sendChannelEof(channel.local_id);
+
+    var payload: [64]u8 = undefined;
+    var writer = BufferWriter.init(&payload, 0);
+    try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+    try writer.writeU32(11);
+    try writer.writeU32LenString("closed");
+    try writer.writeU32LenString("");
+    try feedKeepaliveTestPayload(&client, writer.active());
+    try consumeKeepaliveTestPacket(&client);
+    const event = (try client.getNextEvent()).Event;
+    try std.testing.expectEqualStrings("closed", event.EndSession.ServerDisconnect.description);
+    try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Disconnected);
+    try std.testing.expectError(IoError.notProducing, client.peek(1));
+}
+
+test "keepalive handoff retains rekey guards on deferred channel control" {
+    for ([_]bool{ false, true }) |in_progress| {
+        var prng = std.Random.DefaultPrng.init(58);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+        channel.state = .DataRx;
+        _ = try client.getNextEvent();
+        const token = try client.requestKeepalive();
+        try client.consumed(1);
+        try client.sendChannelEof(channel.local_id);
+        if (in_progress) {
+            client.session.is_rekeying = true;
+            client.session.setSessionState(.KexInitRead);
+        } else {
+            client.local_rekey_pending = true;
+        }
+        try consumeKeepaliveTestPacket(&client);
+        try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, (try client.keepaliveStatus(token)).transmission);
+        try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+        try std.testing.expect(channel.eof_pending);
+        try std.testing.expect(!channel.eof_sent);
     }
 }
 
