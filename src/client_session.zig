@@ -2793,7 +2793,10 @@ pub const Session = struct {
 // Helper: build an unencrypted SSH packet in the provided buffer.
 // Returns the total packet length (header + payload + padding).
 fn buildUnencryptedPacket(buf: []u8, payload: []const u8) usize {
-    const padding_length: u8 = 8;
+    return buildUnencryptedPacketWithPadding(buf, payload, 8);
+}
+
+fn buildUnencryptedPacketWithPadding(buf: []u8, payload: []const u8, padding_length: u8) usize {
     const packet_length: u32 = @intCast(payload.len + padding_length + 1);
     // Build PktHdr the same way wrapPkt does
     const hdr: Protocol.PktHdr = .{
@@ -5440,6 +5443,75 @@ test "client receives exactly advertised maximum channel data" {
         Sshz.default_channel_window - Protocol.MaxChannelDataLen,
         chan.local_window,
     );
+}
+
+test "public read readiness preserves coalesced packets after 32768 plus 19 body bytes" {
+    for ([_]bool{ false, true }) |duplex| {
+        var prng = std.Random.DefaultPrng.init(68);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const channel = client.session.channel_table.allocChannel(42, 65536, 32768).?;
+        channel.state = .DataRx;
+        var data: [32768]u8 = undefined;
+        prng.random().bytes(&data);
+        const messages = [_][]const u8{ &data, data[0..4096], "following packet" };
+        var stream: [2 * Protocol.MaxSSHPacket]u8 = undefined;
+        var stream_len: usize = 0;
+        var first_len: usize = 0;
+        for (messages, 0..) |message, index| {
+            var payload_storage: [Protocol.MaxPayload]u8 = undefined;
+            var payload = BufferWriter.init(&payload_storage, 0);
+            try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+            try payload.writeU32(channel.local_id);
+            try payload.writeU32LenString(message);
+            // A valid eight-byte-aligned plaintext packet, as permitted before
+            // encryption. Its five-byte header leaves a 32787-byte body.
+            const padding: u8 = @intCast(8 + (8 - (Protocol.sizeof_PktHdr + payload.active().len) % 8) % 8);
+            const size = buildUnencryptedPacketWithPadding(stream[stream_len..], payload.active(), padding);
+            stream_len += size;
+            if (index == 0) first_len = size;
+        }
+        try std.testing.expectEqual(@as(usize, 32792), first_len);
+        try std.testing.expectEqual(@as(usize, 5), (try client.getNextEvent()).ReadyToConsume);
+        try client.write(stream[0..5]);
+        try std.testing.expectEqual(@as(usize, 32787), (try client.getNextEvent()).ReadyToConsume);
+        try client.write(stream[5..][0..32768]);
+        if (duplex) _ = try client.requestKeepalive();
+        const next = try client.getNextEvent();
+        const remaining = switch (next) {
+            .ReadyToConsume => |n| n,
+            .ReadyToConsumeAndProduce => |counts| counts.consume,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(usize, 19), remaining);
+        if (duplex) try consumeKeepaliveTestPacket(&client);
+
+        var cursor: usize = 5 + 32768;
+        var delivered: usize = 0;
+        for (0..32) |_| {
+            switch (try client.getNextEvent()) {
+                .ReadyToConsume => |n| {
+                    try std.testing.expect(n > 0);
+                    try std.testing.expect(cursor < stream_len);
+                    const count = @min(n, stream_len - cursor);
+                    try client.write(stream[cursor..][0..count]);
+                    cursor += count;
+                },
+                .Event => |event| {
+                    try std.testing.expect(event == .RxData);
+                    try std.testing.expect(delivered < messages.len);
+                    try std.testing.expectEqualSlices(u8, messages[delivered], event.RxData.data);
+                    delivered += 1;
+                    try client.clearEvent(event);
+                    if (delivered == messages.len) break;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try std.testing.expectEqual(messages.len, delivered);
+        try std.testing.expectEqual(stream_len, cursor);
+        try std.testing.expectEqual(@as(u32, messages.len), client.session.keydata.s2c.seq);
+    }
 }
 
 test "client runtime channel buffer pending and peer limits enforce boundaries" {
