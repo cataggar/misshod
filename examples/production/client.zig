@@ -307,51 +307,52 @@ test "production client pump is compile-checked without network I/O" {
     );
 }
 
+const ProductionTestTransport = struct {
+    // Model stream-accepted bytes waiting for the peer to read, not an
+    // adapter's unsent output queue.
+    to_server: [16384]u8 = undefined,
+    to_server_len: usize = 0,
+    to_client: [16384]u8 = undefined,
+    to_client_len: usize = 0,
+    bytes_written: usize = 0,
+    bytes_read: usize = 0,
+
+    fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
+        return true;
+    }
+
+    fn data(_: *anyopaque, _: []const u8) !void {
+        return error.UnexpectedChannelData;
+    }
+
+    fn extendedData(_: *anyopaque, _: u32, _: []const u8) !void {
+        return error.UnexpectedChannelData;
+    }
+
+    fn read(context: *anyopaque, destination: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const count = @min(7, destination.len, self.to_client_len);
+        @memcpy(destination[0..count], self.to_client[0..count]);
+        std.mem.copyForwards(u8, &self.to_client, self.to_client[count..self.to_client_len]);
+        self.to_client_len -= count;
+        self.bytes_read += count;
+        return count;
+    }
+
+    fn write(context: *anyopaque, bytes: []const u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const count = @min(7, bytes.len, self.to_server.len - self.to_server_len);
+        @memcpy(self.to_server[self.to_server_len..][0..count], bytes[0..count]);
+        self.to_server_len += count;
+        self.bytes_written += count;
+        return count;
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
 fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
-    const Loopback = struct {
-        // Model stream-accepted bytes waiting for the peer to read, not an
-        // adapter's unsent output queue.
-        to_server: [16384]u8 = undefined,
-        to_server_len: usize = 0,
-        to_client: [16384]u8 = undefined,
-        to_client_len: usize = 0,
-        bytes_written: usize = 0,
-        bytes_read: usize = 0,
-
-        fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
-            return true;
-        }
-
-        fn data(_: *anyopaque, _: []const u8) !void {
-            return error.UnexpectedChannelData;
-        }
-
-        fn extendedData(_: *anyopaque, _: u32, _: []const u8) !void {
-            return error.UnexpectedChannelData;
-        }
-
-        fn read(context: *anyopaque, destination: []u8) !usize {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const count = @min(7, destination.len, self.to_client_len);
-            @memcpy(destination[0..count], self.to_client[0..count]);
-            std.mem.copyForwards(u8, &self.to_client, self.to_client[count..self.to_client_len]);
-            self.to_client_len -= count;
-            self.bytes_read += count;
-            return count;
-        }
-
-        fn write(context: *anyopaque, bytes: []const u8) !usize {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const count = @min(7, bytes.len, self.to_server.len - self.to_server_len);
-            @memcpy(self.to_server[self.to_server_len..][0..count], bytes[0..count]);
-            self.to_server_len += count;
-            self.bytes_written += count;
-            return count;
-        }
-
-        fn close(_: *anyopaque) void {}
-    };
-
+    const Loopback = ProductionTestTransport;
     var random = std.Random.DefaultPrng.init(2);
     var server = try sshz.SshzServer.init(
         random.random(),
@@ -487,4 +488,159 @@ test "production pump explicitly observes keepalive after partial direct transpo
 test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {
     try exerciseProductionKeepalive(.Eof);
     try exerciseProductionKeepalive(.Close);
+}
+
+test "production pump discards unframed data across partial writes zero window and real rekey" {
+    const Loopback = ProductionTestTransport;
+    const SinkPolicy = struct {
+        fn data(_: *anyopaque, bytes: []const u8) !void {
+            try std.testing.expectEqualStrings("wake", bytes);
+        }
+    };
+    var random = std.Random.DefaultPrng.init(3);
+    var server = try sshz.SshzServer.initWithLimits(
+        random.random(),
+        @embedFile("production_test_host_key"),
+        std.testing.allocator,
+        .{ .initial_channel_window = 4, .channel_packet_size = 4 },
+    );
+    defer server.deinit();
+    var loopback: Loopback = .{};
+    const config: Config = .{
+        .username = "test",
+        .endpoint = "example.invalid:22",
+        .command = "true",
+        .limits = .{
+            .deadlines = .{ .handshake = 30000, .authentication = 30000, .idle = 30000, .total_session = 30000 },
+            .key_lifetime = .{ .rekey_after_monotonic_ticks = 3000 },
+        },
+        .host_keys = .{ .context = &loopback, .verify_fn = Loopback.verify },
+        .credentials = .{ .context = &loopback },
+        .sink = .{ .context = &loopback, .data_fn = SinkPolicy.data, .extended_data_fn = Loopback.extendedData },
+    };
+    const transport: common.Transport = .{
+        .context = &loopback,
+        .read_fn = Loopback.read,
+        .write_fn = Loopback.write,
+        .close_fn = Loopback.close,
+    };
+    var client = try init(random.random(), std.testing.allocator, &config, 0);
+    defer client.deinit();
+    try client.setTryNoneAuth(true);
+    var scratch: [64]u8 = undefined;
+    var command_requested = false;
+    var submitted_at: ?usize = null;
+    var suffix_discarded = false;
+    var replacement_submitted = false;
+    var wake_sent = false;
+    var rekey_discarded = false;
+    var token: ?sshz.KeepaliveToken = null;
+    var received: [32]u8 = undefined;
+    var received_len: usize = 0;
+    var server_channel: ?u32 = null;
+    for (0..4000) |step| {
+        switch (try server.getNextEvent()) {
+            .ReadyToConsume => |n| {
+                const count = @min(n, loopback.to_server_len);
+                if (count != 0) {
+                    try server.write(loopback.to_server[0..count]);
+                    std.mem.copyForwards(u8, &loopback.to_server, loopback.to_server[count..loopback.to_server_len]);
+                    loopback.to_server_len -= count;
+                } else if (received_len == 8 and !wake_sent) {
+                    const destination = try server.getChannelWriteBuffer(server_channel.?);
+                    try std.testing.expect(destination.len >= 4);
+                    @memcpy(destination[0..4], "wake");
+                    try server.channelWriteComplete(server_channel.?, 4);
+                    wake_sent = true;
+                }
+            },
+            .ReadyToProduce, .ReadyToConsumeAndProduce => {
+                const bytes = try server.peek(loopback.to_client.len - loopback.to_client_len);
+                const count = bytes.len;
+                @memcpy(loopback.to_client[loopback.to_client_len..][0..count], bytes);
+                loopback.to_client_len += count;
+                try server.consumed(count);
+            },
+            .Event => |event| switch (event) {
+                .UserAuth => try server.decideUserAuth(.Allow),
+                .ChannelOpenRequest => |request| {
+                    server_channel = request.channel;
+                    try server.acceptChannelOpen(request.channel);
+                },
+                .Connected => try server.clearEvent(event),
+                .ChannelRequest => |request| {
+                    if (request.request == .Exec) command_requested = true;
+                    try server.clearEvent(event);
+                },
+                .RxData => |data| {
+                    try std.testing.expect(data.data.len <= received.len - received_len);
+                    @memcpy(received[received_len..][0..data.data.len], data.data);
+                    received_len += data.data.len;
+                    try server.clearEvent(event);
+                },
+                else => return error.UnexpectedServerEvent,
+            },
+        }
+        _ = try pumpOnce(&client, &config, transport, &scratch, .{
+            .readable = loopback.to_client_len != 0,
+            .writable = loopback.to_server_len < loopback.to_server.len,
+        }, if (wake_sent) 10000 else step);
+        const channel = client.automaticSessionChannelId() orelse continue;
+        if (!command_requested) continue;
+        if (submitted_at) |written| {
+            if (!suffix_discarded and loopback.bytes_written > written) {
+                const remaining = try client.peek(scratch.len);
+                try std.testing.expect(remaining.len != 0);
+                var before: [64]u8 = undefined;
+                const remaining_len = remaining.len;
+                @memcpy(before[0..remaining_len], remaining);
+                const keys = client.keyLifetimeStatus();
+                try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel));
+                try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+                try std.testing.expectEqualSlices(u8, before[0..remaining_len], try client.peek(scratch.len));
+                suffix_discarded = true;
+            }
+        } else {
+            try std.testing.expectEqual(@as(usize, 11), try sendChannelData(&client, channel, "keepdiscard"));
+            submitted_at = loopback.bytes_written;
+        }
+        if (suffix_discarded and !replacement_submitted and
+            (try client.getChannelWriteBuffer(channel)).len != 0)
+        {
+            // The first four-byte packet has been handed off, but its peer
+            // credit cannot have returned during this same pump call.
+            const keys = client.keyLifetimeStatus();
+            try std.testing.expectEqual(@as(usize, 7), try sendChannelData(&client, channel, "blocked"));
+            try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+            try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel));
+            try std.testing.expectEqual(@as(usize, 0), try client.discardUnframedChannelWrite(channel));
+            try std.testing.expectEqual(@as(usize, 4), try sendChannelData(&client, channel, "new!"));
+            replacement_submitted = true;
+        }
+        if (wake_sent and !rekey_discarded and client.keyLifetimeStatus().rekey_in_progress) {
+            const next = client.getNextEvent() catch |err| switch (err) {
+                error.NotReady => continue,
+                else => return err,
+            };
+            if (next == .ReadyToConsume) {
+                const keys = client.keyLifetimeStatus();
+                try std.testing.expectEqual(@as(usize, 5), try sendChannelData(&client, channel, "rekey"));
+                try std.testing.expectEqual(@as(usize, 5), try client.discardUnframedChannelWrite(channel));
+                try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+                rekey_discarded = true;
+            }
+        }
+        if (rekey_discarded and !client.keyLifetimeStatus().rekey_in_progress and token == null) {
+            try std.testing.expect(client.keyLifetimeStatus().outbound.epoch >= 2);
+            token = try client.requestKeepalive();
+        }
+        if (token) |id| {
+            if ((try client.keepaliveStatus(id)).outcome == .Acknowledged) {
+                try std.testing.expectEqualStrings("keepnew!", received[0..received_len]);
+                try std.testing.expect(client.isActive());
+                return;
+            }
+        }
+    }
+    return error.DiscardScenarioIncomplete;
 }

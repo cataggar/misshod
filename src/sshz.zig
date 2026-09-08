@@ -1841,6 +1841,30 @@ pub fn SshzImpl(role: Role) type {
             }
         }
 
+        /// Discards accepted client-channel plaintext that has not been framed.
+        ///
+        /// Returns discarded payload bytes, excluding the in-flight prefix.
+        /// Framed bytes, including an entirely unsent encrypted packet, must
+        /// still be pumped normally. This does not close the channel, cancel
+        /// its queued EOF/CLOSE, refund peer window, or discard transport bytes.
+        /// Already-queued EOF/CLOSE may become writable after the discard.
+        ///
+        /// Finish any getChannelWriteBuffer/channelWriteComplete pair first;
+        /// never reuse that borrowed buffer or submit it after this call.
+        /// Unknown, opening, close-sent/received and closed channels return
+        /// UnexpectedResponse. Repeated discard on an open channel returns 0.
+        /// The server role returns UnimplementedService.
+        pub fn discardUnframedChannelWrite(self: *Self, channel_id: u32) SshzError!usize {
+            if (self.terminated) return IoError.SessionTerminated;
+            return switch (role) {
+                .Client => self.session.discardUnframedChannelWrite(channel_id, self) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         /// Returns receive-window credit for an ordinary client channel.
         ///
         /// This is valid only after automatic channel read credit has been
