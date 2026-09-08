@@ -20,7 +20,9 @@ and provide a migration note for source-breaking changes.
 The candidate production-facing surface is the `sshz` module's
 `SshzClient`, `SshzServer`, event and event-payload types,
 `ResourceLimits`, deadline/key-lifetime types, `SshOpenFailureReason`,
-`SshzError`, and buffer helper types. After API version 1, these names,
+`KeepaliveToken`, `KeepaliveStatus`, `KeepaliveTransmission`,
+`KeepaliveOutcome`, `KeepaliveReply`, `SshzError`, and buffer helper types.
+After API version 1, these names,
 their documented semantics, and default resource limits follow semantic
 versioning: source-breaking changes require a major version; additive events
 or errors require at least a minor version; fixes that preserve the contract
@@ -159,6 +161,96 @@ false, so close cannot lose its result. Open failures release their reservation
 automatically. The production client example treats status zero as success and
 reports nonzero, signal, and missing-result outcomes as terminal errors.
 
+## Explicit acknowledged client keepalives
+
+`requestKeepalive()` queues `keepalive@openssh.com` with `want_reply=true`
+after authentication and returns a value-owned `KeepaliveToken`. It never
+writes channel data or installs automatic probes, a clock, deadlines, retries,
+or a connection-health policy. It is valid on an authenticated zero-channel
+client and can queue while output or rekey is in progress.
+
+Poll `keepaliveStatus(token)` for a value-owned snapshot. No new event-loop
+variant is required. The snapshot's `token`, `transmission`,
+`transport_flushed`, and `outcome` contain no borrowed storage:
+
+| Field/state | Meaning |
+| --- | --- |
+| `transmission.Queued` | The request is accepted but not yet framed; output or rekey may be blocking it. |
+| `transmission.Emitting` | The request is framed, but some or all bytes remain unconsumed. A zero-byte write is not progress. |
+| `transmission.HandedToTransport` | The caller has called `consumed` for every byte of this packet, including its padding and MAC. This is not itself proof of a TCP send or a peer reply. |
+| `transport_flushed` | The caller has explicitly confirmed its underlying transport accepted all bytes through this request with `markKeepaliveFlushed(token)`. |
+| `outcome.Pending` | No acknowledgement or terminal observation yet. |
+| `outcome.Acknowledged(.Success or .Failure)` | A correlated SSH `REQUEST_SUCCESS` or `REQUEST_FAILURE` arrived. Both prove peer responsiveness; failure usually means the peer does not implement this request. Neither proves remote application progress. |
+| `outcome.Cancelled` | The caller abandoned observation with `cancelKeepalive(token)`. |
+| `outcome.Disconnected` | `EndSession`, fatal fail-closed cleanup, or deinitialization ended a still-pending request. |
+
+### The flush boundary belongs to the transport
+
+For a direct socket pump, call `consumed(actual_sent)` only after each
+successful send. Once the snapshot becomes `HandedToTransport`, call
+`markKeepaliveFlushed(token)` and start any reply deadline at that time, not
+at enqueue. This method returns `NotReady` before handoff and is idempotent
+after handoff. It trusts the caller's flush assertion; sshz does no I/O.
+This local transport flush does not mean TCP acknowledgement or peer receipt.
+
+A buffering adapter may consume bytes into an application-owned ordered
+output queue. When the token first becomes `HandedToTransport`, record the
+queue's cumulative byte boundary immediately after that `consumed` call.
+`consumed` can prepare subsequent packets, but never consumes those bytes
+itself. Preserve the queued bytes and wait until the underlying stream
+accepts everything through the recorded boundary before marking the token
+flushed. Waiting for the entire queue to drain is also valid, but may delay
+the deadline under continuous output. Never interpret handoff to an unsent
+queue as a successful send. An acknowledgement can arrive before an adapter
+reports the flush; it still belongs to the same token.
+
+The production client example's opt-in keepalive test exercises its real
+`pumpOnce` with partial direct-transport writes, explicit flush marking, and
+EOF/CLOSE queued behind a cancelled probe without further peer input, all
+without sockets or a remote server.
+
+### Ordering, cancellation, and token lifetime
+
+Keepalives and `requestRemoteForward`/`cancelRemoteForward` share exactly one
+outstanding reply-requesting global request. A second request returns
+`ResourceLimitExceeded`; the caller may wait and retry without terminating
+the session for this documented local contention case. Existing forwarding
+events and payloads remain unchanged.
+
+Waiting for a keepalive reply does not gate deferred channel output. Queued
+EOF/CLOSE and other channel writes resume after the global request's handoff,
+subject to rekey gating and processing any already-received packet first.
+
+After an acknowledgement, use `clearKeepalive(token)` to release the retained
+result before requesting another keepalive. Clearing a `Pending` result
+returns `NotReady`. Tokens are scoped to the issuing client, never wrap or
+repeat during that client's lifetime, and must not be used with another
+client. Released or stale tokens return `InvalidKeepaliveToken`. Copy any
+snapshot needed after destroying the client; copied acknowledgements remain
+valid independently of the client.
+
+`cancelKeepalive(token)` is idempotent and does not replace an already terminal
+outcome. Cancelling a `Queued` request retracts it. Once `Emitting`, even if
+no bytes have been consumed, encryption/compression state has advanced and
+the packet cannot safely be removed. Continue pumping the exact stream:
+the cancelled request drains normally and reserves its reply slot until the
+old reply arrives or the connection ends. Clearing the cancelled result
+**does not** release this slot. A late reply is discarded for that cancelled
+request, never credited to a newer probe or forwarding request. If no reply
+ever arrives, close/deinitialize to abandon the slot; there is no unsafe
+timeout-reset operation.
+
+For a grace period that can recover on a late reply, keep the same request
+`Pending` rather than cancelling it. The application owns all timeouts,
+including a separate queued/send-stall budget. A local observation timeout
+alone does not release the slot or alter sshz's state. Unsolicited responses
+and responses to an unframed request are protocol errors. SSH global replies
+have no wire IDs: correlation follows the protocol's ordered, one-reply-per-
+request contract, not a peer-echoed token. An extra response after completion
+cannot be distinguished from a later request's response if a nonconforming
+peer sends it only after the later request; local tokens do not add wire
+identities.
+
 ## Server authentication and authorization
 
 `UserAuth` means protocol-level parsing succeeded; it does **not** mean the
@@ -265,6 +357,9 @@ around backpressure.
 - `NotReady`, `cannotAcceptWrite`, `notProducing`, and `notEnoughData` normally
   indicate pump ordering/backpressure mistakes. `InvalidChannelReadCredit` and
   `ChannelReadCreditExceeded` identify invalid manual receive-credit calls.
+  `InvalidKeepaliveToken` identifies a stale/released token; local
+  `ResourceLimitExceeded` from a second outstanding global request or retained
+  keepalive result is the documented contention case above.
   Correct the poll/accounting state; never drop or duplicate bytes.
 - `BufferError`, malformed framing/MAC, negotiation, unexpected response,
   channel-window/packet, auth/KEX/resource, host-key-change, and

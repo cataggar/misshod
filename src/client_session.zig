@@ -86,12 +86,14 @@ pub const SessionState = enum {
 const PendingGlobalRequestKind = enum {
     TcpipForward,
     CancelTcpipForward,
+    Keepalive,
 };
 
 const PendingGlobalRequest = struct {
     kind: PendingGlobalRequestKind,
-    bind_address: []const u8,
-    bind_port: u32,
+    bind_address: []const u8 = "",
+    bind_port: u32 = 0,
+    transmission: Sshz.KeepaliveTransmission = .Emitting,
 };
 
 const MaxAuthAttemptsPerMethod: u8 = 1;
@@ -132,6 +134,9 @@ pub const Session = struct {
     pending_window_change: ?[4]u32,
     channel_window_adjust_in_flight: bool,
     pending_global_request: ?PendingGlobalRequest,
+    keepalive: ?Sshz.KeepaliveStatus = null,
+    last_keepalive_id: u64 = 0,
+    global_requests_ended: bool = false,
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     agent_forwarding_enabled: bool,
     agent_forwarding_requested: bool,
@@ -261,7 +266,7 @@ pub const Session = struct {
         self.pending_channel_replies_head = 0;
         self.pending_channel_replies_len = 0;
         self.channel_window_adjust_in_flight = false;
-        self.pending_global_request = null;
+        self.endGlobalRequests();
         self.keydata.clear();
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
@@ -290,6 +295,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.endGlobalRequests();
         self.clearAndFreeOptional(&self.privkey_ascii);
         self.clearAndFreeOptional(&self.privkey_passphrase);
         self.clearAndFreeOptional(&self.auth_passphrase);
@@ -1046,6 +1052,7 @@ pub const Session = struct {
             },
             .ChannelActive => {
                 if (try self.flushPendingChannelReply(sshz)) return;
+                if (try self.flushPendingKeepalive(sshz)) return;
                 try self.advanceChannel(sshz, outkeys);
             },
         }
@@ -1366,6 +1373,7 @@ pub const Session = struct {
         bind_address: []const u8,
         bind_port: u32,
     ) SshzError!void {
+        if (self.global_requests_ended or sshz.terminated) return IoError.SessionTerminated;
         if (self.pending_global_request != null) return IoError.ResourceLimitExceeded;
         if (sshz.iostate_wr != .Idle or self.active_channel_id != null) {
             return IoError.cannotAcceptWrite;
@@ -1385,6 +1393,7 @@ pub const Session = struct {
         try pkt.writeU32LenString(switch (kind) {
             .TcpipForward => "tcpip-forward",
             .CancelTcpipForward => "cancel-tcpip-forward",
+            .Keepalive => unreachable,
         });
         try pkt.writeBoolean(true); // want reply
         try pkt.writeU32LenString(stored_bind_address);
@@ -1396,7 +1405,97 @@ pub const Session = struct {
             .bind_address = stored_bind_address,
             .bind_port = bind_port,
         };
-        try sshz.requestWrite(wrapped, .Idle);
+        try sshz.requestWrite(wrapped, .GlobalRequestWriteComplete);
+    }
+
+    pub fn queueKeepalive(self: *Self) SshzError!Sshz.KeepaliveToken {
+        if (self.global_requests_ended) return IoError.SessionTerminated;
+        if (!self.user_authenticated) return IoError.NotReady;
+        if (self.pending_global_request != null or self.keepalive != null)
+            return IoError.ResourceLimitExceeded;
+        if (self.last_keepalive_id == std.math.maxInt(u64)) return IoError.ResourceLimitExceeded;
+        self.last_keepalive_id += 1;
+        const token = Sshz.KeepaliveToken{ .id = self.last_keepalive_id };
+        self.keepalive = .{ .token = token };
+        self.pending_global_request = .{ .kind = .Keepalive, .transmission = .Queued };
+        return token;
+    }
+
+    pub fn keepaliveStatus(self: *const Self, token: Sshz.KeepaliveToken) SshzError!Sshz.KeepaliveStatus {
+        const status = self.keepalive orelse return IoError.InvalidKeepaliveToken;
+        if (status.token.id != token.id) return IoError.InvalidKeepaliveToken;
+        return status;
+    }
+
+    pub fn markKeepaliveFlushed(self: *Self, token: Sshz.KeepaliveToken) SshzError!void {
+        const status = try self.keepaliveStatus(token);
+        if (status.transmission != .HandedToTransport) return IoError.NotReady;
+        if (status.outcome == .Disconnected) return IoError.SessionTerminated;
+        self.keepalive.?.transport_flushed = true;
+    }
+
+    pub fn cancelKeepalive(self: *Self, token: Sshz.KeepaliveToken) SshzError!void {
+        const status = try self.keepaliveStatus(token);
+        if (status.outcome != .Pending) return;
+        self.keepalive.?.outcome = .Cancelled;
+        // Once framed, even zero consumed bytes cannot safely be retracted:
+        // encryption sequence numbers and compression have already advanced.
+        if (status.transmission == .Queued) self.pending_global_request = null;
+    }
+
+    pub fn clearKeepalive(self: *Self, token: Sshz.KeepaliveToken) SshzError!void {
+        if ((try self.keepaliveStatus(token)).outcome == .Pending) return IoError.NotReady;
+        self.keepalive = null;
+    }
+
+    pub fn endGlobalRequests(self: *Self) void {
+        self.global_requests_ended = true;
+        self.pending_global_request = null;
+        if (self.keepalive) |*status| {
+            if (status.outcome == .Pending) status.outcome = .Disconnected;
+        }
+    }
+
+    pub fn flushPendingKeepalive(self: *Self, sshz: *SshzClient) SshzError!bool {
+        const pending = self.pending_global_request orelse return false;
+        if (pending.kind != .Keepalive or pending.transmission != .Queued or
+            self.global_requests_ended or self.sessionState != .ChannelActive or
+            self.is_rekeying or sshz.local_rekey_pending or sshz.iostate_wr != .Idle)
+            return false;
+        // Process a fully received packet before initiating another request.
+        // Incomplete reads remain intact while the independent write runs.
+        switch (self.ioSessionState) {
+            .Idle, .ReadPktHdr, .ReadPktBody => {},
+            else => return false,
+        }
+        var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+        try pkt.writeU32LenString("keepalive@openssh.com");
+        try pkt.writeBoolean(true);
+        try sshz.requestWrite(
+            try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &sshz.iobuf_wr),
+            .GlobalRequestWriteComplete,
+        );
+        self.pending_global_request.?.transmission = .Emitting;
+        self.keepalive.?.transmission = .Emitting;
+        return true;
+    }
+
+    pub fn completeGlobalRequestWrite(self: *Self, sshz: *SshzClient) SshzError!void {
+        const pending = if (self.pending_global_request) |*request|
+            request
+        else
+            return IoError.UnexpectedResponse;
+        if (pending.transmission != .Emitting) return IoError.UnexpectedResponse;
+        pending.transmission = .HandedToTransport;
+        if (pending.kind == .Keepalive) {
+            if (self.keepalive) |*status| status.transmission = .HandedToTransport;
+        }
+        const received_packet_pending = switch (self.ioSessionState) {
+            .ReadPktCompletion => true,
+            else => false,
+        };
+        if (!received_packet_pending) _ = try self.dispatchDeferredChannelWrite(sshz);
     }
 
     pub fn requestRemoteForward(self: *Self, sshz: *SshzClient, bind_address: []const u8, bind_port: u32) SshzError!void {
@@ -1705,6 +1804,7 @@ pub const Session = struct {
         if (self.sessionState != .ChannelActive or self.is_rekeying or sshz.local_rekey_pending or
             sshz.iostate_wr != .Idle) return false;
         if (try self.flushPendingChannelReply(sshz)) return true;
+        if (try self.flushPendingKeepalive(sshz)) return true;
         for (0..MaxChannels) |_| {
             const chan = self.channel_table.findNextDeferredWrite() orelse return false;
             if ((chan.close_received or chan.close_pending) and chan.tx_in_flight_len == 0) {
@@ -2164,9 +2264,11 @@ pub const Session = struct {
 
     fn handleGlobalRequestSuccess(self: *Self, rdr: *BufferReader, sshz: *SshzClient) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.transmission != .HandedToTransport) return IoError.UnexpectedResponse;
         self.pending_global_request = null;
 
         switch (pending.kind) {
+            .Keepalive => self.acknowledgeKeepalive(.Success),
             .TcpipForward => {
                 const bound_port = if (pending.bind_port == 0) try rdr.readU32() else pending.bind_port;
                 sshz.requestEvent(.{ .TcpipForwardSuccess = .{
@@ -2186,9 +2288,11 @@ pub const Session = struct {
 
     fn handleGlobalRequestFailure(self: *Self, sshz: *SshzClient) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.transmission != .HandedToTransport) return IoError.UnexpectedResponse;
         self.pending_global_request = null;
 
         switch (pending.kind) {
+            .Keepalive => self.acknowledgeKeepalive(.Failure),
             .TcpipForward => {
                 sshz.requestEvent(.{ .TcpipForwardFailure = .{
                     .bind_address = pending.bind_address,
@@ -2202,6 +2306,13 @@ pub const Session = struct {
                 } }, .Idle);
             },
         }
+    }
+
+    fn acknowledgeKeepalive(self: *Self, reply: Sshz.KeepaliveReply) void {
+        if (self.keepalive) |*status| {
+            if (status.outcome == .Pending) status.outcome = .{ .Acknowledged = reply };
+        }
+        self.setIoSessionState(.ReadPktHdr);
     }
 
     /// RFC 4252 userauth replies drive `sessionState` directly, so one accepted
@@ -4157,6 +4268,7 @@ test "requestRemoteForward writes tcpip-forward global request" {
     m.session.encrypted = false;
     m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
 
     try m.requestRemoteForward("127.0.0.1", 0);
     try std.testing.expect(m.session.pending_global_request != null);
@@ -4182,6 +4294,7 @@ test "cancelRemoteForward writes cancel-tcpip-forward global request" {
     m.session.encrypted = false;
     m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
 
     try m.cancelRemoteForward("127.0.0.1", 2200);
 
@@ -4194,6 +4307,456 @@ test "cancelRemoteForward writes cancel-tcpip-forward global request" {
     try std.testing.expectEqual(@as(u32, 2200), try rdr.readU32());
 }
 
+fn keepaliveTestClient(random: std.Random) !SshzClient {
+    var client = try SshzClient.init(random, "test", std.testing.allocator);
+    client.session.user_authenticated = true;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    return client;
+}
+
+fn feedKeepaliveTestPayload(client: *SshzClient, payload: []const u8) !void {
+    var packet: [256]u8 = undefined;
+    const len = buildUnencryptedPacket(&packet, payload);
+    try feedKeepaliveTestBytes(client, packet[0..len]);
+}
+
+fn feedKeepaliveTestBytes(client: *SshzClient, packet: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < packet.len) {
+        const available = switch (try client.getNextEvent()) {
+            .ReadyToConsume => |n| n,
+            .ReadyToConsumeAndProduce => |counts| counts.consume,
+            else => return error.TestUnexpectedResult,
+        };
+        const count = @min(available, packet.len - offset);
+        try client.write(packet[offset..][0..count]);
+        offset += count;
+    }
+}
+
+fn consumeKeepaliveTestPacket(client: *SshzClient) !void {
+    const bytes = try client.peek(Protocol.MaxSSHPacket);
+    try client.consumed(bytes.len);
+}
+
+test "keepalive is opt-in and acknowledges both reply types with owned tokens" {
+    for ([_]Sshz.KeepaliveReply{ .Success, .Failure }) |reply| {
+        var prng = std.Random.DefaultPrng.init(43);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+
+        const token = try client.requestKeepalive();
+        try std.testing.expectEqual(Sshz.KeepaliveTransmission.Emitting, (try client.keepaliveStatus(token)).transmission);
+        try std.testing.expectError(IoError.NotReady, client.markKeepaliveFlushed(token));
+        try std.testing.expectError(IoError.NotReady, client.clearKeepalive(token));
+        var rdr = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST), try rdr.readU8());
+        try std.testing.expectEqualStrings("keepalive@openssh.com", try rdr.readU32LenString());
+        try std.testing.expect(try rdr.readBoolean());
+        try std.testing.expectEqual(rdr.payload.len, rdr.off);
+
+        try consumeKeepaliveTestPacket(&client);
+        var status = try client.keepaliveStatus(token);
+        try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, status.transmission);
+        try std.testing.expect(!status.transport_flushed);
+        try std.testing.expect(status.outcome == .Pending);
+        try client.markKeepaliveFlushed(token);
+        try client.markKeepaliveFlushed(token);
+        try feedKeepaliveTestPayload(&client, &.{@intFromEnum(switch (reply) {
+            .Success => Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS,
+            .Failure => Protocol.MsgId.SSH_MSG_REQUEST_FAILURE,
+        })});
+        status = try client.keepaliveStatus(token);
+        try std.testing.expect(status.transport_flushed);
+        try std.testing.expectEqual(reply, status.outcome.Acknowledged);
+        try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+        try client.cancelKeepalive(token);
+        try std.testing.expectEqualDeep(status, try client.keepaliveStatus(token));
+        try client.clearKeepalive(token);
+        const next_token = try client.requestKeepalive();
+        try std.testing.expect(next_token.id > token.id);
+        try std.testing.expectError(IoError.InvalidKeepaliveToken, client.keepaliveStatus(token));
+        try std.testing.expectError(IoError.InvalidKeepaliveToken, client.markKeepaliveFlushed(token));
+        try std.testing.expectError(IoError.InvalidKeepaliveToken, client.cancelKeepalive(token));
+        try std.testing.expectError(IoError.InvalidKeepaliveToken, client.clearKeepalive(token));
+        client.deinit();
+        try std.testing.expectEqual(reply, status.outcome.Acknowledged);
+        try std.testing.expectEqual(token.id, status.token.id);
+    }
+}
+
+test "keepalive distinguishes queued partial emission and explicit transport flush" {
+    var prng = std.Random.DefaultPrng.init(44);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    _ = try client.getNextEvent();
+    @memcpy(client.iobuf_wr[0..5], "prior");
+    try client.requestWrite(client.iobuf_wr[0..5], .WriteCompletePreserveState);
+
+    const token = try client.requestKeepalive();
+    try std.testing.expectEqual(Sshz.KeepaliveTransmission.Queued, (try client.keepaliveStatus(token)).transmission);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+    try std.testing.expectError(IoError.NotReady, client.markKeepaliveFlushed(token));
+    try client.consumed(4);
+    try std.testing.expectEqual(Sshz.KeepaliveTransmission.Queued, (try client.keepaliveStatus(token)).transmission);
+    try std.testing.expectEqualStrings("r", try client.peek(1));
+    try client.consumed(1);
+
+    const total = (try client.peek(Protocol.MaxSSHPacket)).len;
+    try std.testing.expectEqual(@as(usize, 1), (try client.peek(1)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try client.peek(0)).len);
+    try client.consumed(0);
+    try std.testing.expectError(IoError.notEnoughData, client.consumed(total + 1));
+    for (0..total - 1) |i| {
+        try client.consumed(1);
+        const status = try client.keepaliveStatus(token);
+        try std.testing.expectEqual(Sshz.KeepaliveTransmission.Emitting, status.transmission);
+        try std.testing.expect(!status.transport_flushed);
+        const next = try client.getNextEvent();
+        try std.testing.expectEqual(total - i - 1, next.ReadyToConsumeAndProduce.produce);
+    }
+    try client.consumed(1);
+    try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, (try client.keepaliveStatus(token)).transmission);
+    // consumed may mean a buffering adapter accepted the bytes, not a send.
+    try std.testing.expect(!(try client.keepaliveStatus(token)).transport_flushed);
+    try client.markKeepaliveFlushed(token);
+    try std.testing.expect((try client.keepaliveStatus(token)).transport_flushed);
+}
+
+test "keepalive and forwarding share one ordered global-request slot" {
+    var prng = std.Random.DefaultPrng.init(45);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    try client.requestRemoteForward("localhost", 0);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+    try consumeKeepaliveTestPacket(&client);
+    try feedKeepaliveTestPayload(&client, &.{ @intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS), 0, 0, 8, 174 });
+    const forward_event = (try client.getNextEvent()).Event;
+    try std.testing.expectEqualStrings("localhost", forward_event.TcpipForwardSuccess.bind_address);
+    try std.testing.expectEqual(@as(u32, 2222), forward_event.TcpipForwardSuccess.bound_port);
+    // Queueing a probe must not overwrite a borrowed forwarding event.
+    const token = try client.requestKeepalive();
+    try std.testing.expectEqual(Sshz.KeepaliveTransmission.Queued, (try client.keepaliveStatus(token)).transmission);
+    try std.testing.expectEqualStrings("localhost", forward_event.TcpipForwardSuccess.bind_address);
+    try client.clearEvent(forward_event);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestRemoteForward("localhost", 22));
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.cancelRemoteForward("localhost", 2222));
+    try consumeKeepaliveTestPacket(&client);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+
+    // Forwarding is independent of retention of a completed keepalive result.
+    try client.cancelRemoteForward("localhost", 2222);
+    try consumeKeepaliveTestPacket(&client);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS)});
+    const cancel_event = (try client.getNextEvent()).Event;
+    try std.testing.expectEqual(@as(u32, 2222), cancel_event.CancelTcpipForwardSuccess.bind_port);
+    try client.clearEvent(cancel_event);
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+}
+
+test "cancelled framed keepalive retains late-reply slot even after result release" {
+    for ([_]usize{ 0, 1, std.math.maxInt(usize) }) |consumed| {
+        var prng = std.Random.DefaultPrng.init(46);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const token = try client.requestKeepalive();
+        const packet_len = (try client.peek(Protocol.MaxSSHPacket)).len;
+        try client.consumed(@min(consumed, packet_len));
+        try client.cancelKeepalive(token);
+        try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Cancelled);
+        try client.clearKeepalive(token);
+        try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+        try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestRemoteForward("localhost", 22));
+        if (consumed < packet_len) try consumeKeepaliveTestPacket(&client);
+        try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+        try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS)});
+        const newer = try client.requestKeepalive();
+        try std.testing.expect(newer.id > token.id);
+        try consumeKeepaliveTestPacket(&client);
+        try std.testing.expect((try client.keepaliveStatus(newer)).outcome == .Pending);
+        try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+        try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(newer)).outcome.Acknowledged);
+    }
+}
+
+test "cancelled keepalive result cannot be overwritten by its late reply" {
+    var prng = std.Random.DefaultPrng.init(53);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const token = try client.requestKeepalive();
+    try consumeKeepaliveTestPacket(&client);
+    try client.cancelKeepalive(token);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Cancelled);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+    try client.clearKeepalive(token);
+    _ = try client.requestKeepalive();
+}
+
+test "global-request completion preserves partially received packets" {
+    for ([_]bool{ false, true }) |keepalive| {
+        var prng = std.Random.DefaultPrng.init(54);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        var packet: [64]u8 = undefined;
+        const len = buildUnencryptedPacket(&packet, &.{ @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE), 0, 0, 0, 1, 'x' });
+        try feedKeepaliveTestBytes(&client, packet[0 .. Protocol.sizeof_PktHdr + 1]);
+        const token = if (keepalive)
+            try client.requestKeepalive()
+        else blk: {
+            try client.requestRemoteForward("localhost", 22);
+            break :blk null;
+        };
+        try consumeKeepaliveTestPacket(&client);
+        try feedKeepaliveTestBytes(&client, packet[Protocol.sizeof_PktHdr + 1 .. len]);
+        try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+        if (token) |id| {
+            try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(id)).outcome.Acknowledged);
+        } else {
+            const event = (try client.getNextEvent()).Event;
+            try std.testing.expectEqual(@as(u32, 22), event.TcpipForwardFailure.bind_port);
+            try client.clearEvent(event);
+        }
+    }
+}
+
+test "keepalive handoff dispatches queued EOF and CLOSE without a reply" {
+    for ([_]bool{ false, true }) |partial_body| {
+        for ([_]ChannelControl{ .Eof, .Close }) |control| {
+            for ([_]bool{ false, true }) |cancelled| {
+                var prng = std.Random.DefaultPrng.init(56);
+                var client = try keepaliveTestClient(prng.random());
+                defer client.deinit();
+                const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+                channel.state = .DataRx;
+                var packet: [64]u8 = undefined;
+                const len = buildUnencryptedPacket(&packet, &.{ @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE), 0, 0, 0, 1, 'x' });
+                if (partial_body) {
+                    try feedKeepaliveTestBytes(&client, packet[0 .. Protocol.sizeof_PktHdr + 1]);
+                } else {
+                    _ = try client.getNextEvent();
+                }
+
+                const token = try client.requestKeepalive();
+                const keepalive_len = (try client.peek(Protocol.MaxSSHPacket)).len;
+                try client.consumed(1);
+                switch (control) {
+                    .Eof => try client.sendChannelEof(channel.local_id),
+                    .Close => try client.sendChannelClose(channel.local_id),
+                }
+                if (cancelled) try client.cancelKeepalive(token);
+                const before = (try client.getNextEvent()).ReadyToConsumeAndProduce;
+                try std.testing.expectEqual(keepalive_len - 1, before.produce);
+                try consumeKeepaliveTestPacket(&client);
+
+                // No peer bytes are delivered between queuing control and
+                // this handoff. The public pump must expose the next packet.
+                const after = try client.getNextEvent();
+                try std.testing.expect(after == .ReadyToConsumeAndProduce);
+                try std.testing.expectEqual(before.consume, after.ReadyToConsumeAndProduce.consume);
+                var rdr = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+                try std.testing.expectEqual(@intFromEnum(switch (control) {
+                    .Eof => Protocol.MsgId.SSH_MSG_CHANNEL_EOF,
+                    .Close => Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE,
+                }), try rdr.readU8());
+                try std.testing.expectEqual(@as(u32, 42), try rdr.readU32());
+                try std.testing.expectEqual(rdr.payload.len, rdr.off);
+                const status = try client.keepaliveStatus(token);
+                try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, status.transmission);
+                try std.testing.expect(if (cancelled) status.outcome == .Cancelled else status.outcome == .Pending);
+                if (control == .Eof) try std.testing.expect(!try client.channelEofFlushed(channel.local_id));
+                try client.consumed(1);
+                try consumeKeepaliveTestPacket(&client);
+                if (control == .Eof) try std.testing.expect(try client.channelEofFlushed(channel.local_id));
+                if (partial_body) try feedKeepaliveTestBytes(&client, packet[Protocol.sizeof_PktHdr + 1 .. len]);
+                try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+            }
+        }
+    }
+}
+
+test "keepalive handoff processes a received disconnect before deferred channel control" {
+    var prng = std.Random.DefaultPrng.init(57);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+    channel.state = .DataRx;
+    _ = try client.getNextEvent();
+    const token = try client.requestKeepalive();
+    try client.consumed(1);
+    try client.sendChannelEof(channel.local_id);
+
+    var payload: [64]u8 = undefined;
+    var writer = BufferWriter.init(&payload, 0);
+    try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+    try writer.writeU32(11);
+    try writer.writeU32LenString("closed");
+    try writer.writeU32LenString("");
+    try feedKeepaliveTestPayload(&client, writer.active());
+    try consumeKeepaliveTestPacket(&client);
+    const event = (try client.getNextEvent()).Event;
+    try std.testing.expectEqualStrings("closed", event.EndSession.ServerDisconnect.description);
+    try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Disconnected);
+    try std.testing.expectError(IoError.notProducing, client.peek(1));
+}
+
+test "keepalive handoff retains rekey guards on deferred channel control" {
+    for ([_]bool{ false, true }) |in_progress| {
+        var prng = std.Random.DefaultPrng.init(58);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const channel = client.session.channel_table.allocChannel(42, 1000, 1000).?;
+        channel.state = .DataRx;
+        _ = try client.getNextEvent();
+        const token = try client.requestKeepalive();
+        try client.consumed(1);
+        try client.sendChannelEof(channel.local_id);
+        if (in_progress) {
+            client.session.is_rekeying = true;
+            client.session.setSessionState(.KexInitRead);
+        } else {
+            client.local_rekey_pending = true;
+        }
+        try consumeKeepaliveTestPacket(&client);
+        try std.testing.expectEqual(Sshz.KeepaliveTransmission.HandedToTransport, (try client.keepaliveStatus(token)).transmission);
+        try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+        try std.testing.expect(channel.eof_pending);
+        try std.testing.expect(!channel.eof_sent);
+    }
+}
+
+test "keepalive deinit terminates queued emitting and handed-off tokens" {
+    for ([_]Sshz.KeepaliveTransmission{ .Queued, .Emitting, .HandedToTransport }) |transmission| {
+        var prng = std.Random.DefaultPrng.init(55);
+        var client = try keepaliveTestClient(prng.random());
+        if (transmission == .Queued) {
+            client.session.is_rekeying = true;
+            client.session.setSessionState(.KexInitRead);
+        }
+        const token = try client.requestKeepalive();
+        if (transmission == .HandedToTransport) try consumeKeepaliveTestPacket(&client);
+        const before = try client.keepaliveStatus(token);
+        try std.testing.expectEqual(transmission, before.transmission);
+        client.deinit();
+        try std.testing.expect(client.session.pending_global_request == null);
+        try std.testing.expect(client.session.keepalive.?.outcome == .Disconnected);
+        try std.testing.expect(before.outcome == .Pending);
+        try std.testing.expectError(IoError.SessionTerminated, client.requestKeepalive());
+    }
+}
+
+test "cancelled queued keepalive is retractable and cancellation is idempotent" {
+    var prng = std.Random.DefaultPrng.init(47);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    client.session.is_rekeying = true;
+    client.session.setSessionState(.KexInitRead);
+    const token = try client.requestKeepalive();
+    try std.testing.expectEqual(Sshz.KeepaliveTransmission.Queued, (try client.keepaliveStatus(token)).transmission);
+    try client.cancelKeepalive(token);
+    try client.cancelKeepalive(token);
+    try client.clearKeepalive(token);
+    const newer = try client.requestKeepalive();
+    try std.testing.expect(newer.id > token.id);
+    try std.testing.expectEqual(@as(u32, 0), client.session.keydata.c2s.seq);
+}
+
+test "keepalive grace observes a late reply without installing a timeout policy" {
+    var prng = std.Random.DefaultPrng.init(48);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    try client.initializeDeadlines(0);
+    const token = try client.requestKeepalive();
+    try consumeKeepaliveTestPacket(&client);
+    try client.markKeepaliveFlushed(token);
+    try std.testing.expect((try client.tick(1_000_000)) == null);
+    try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Pending);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+}
+
+test "keepalive replies during rekey preserve the key exchange state" {
+    var prng = std.Random.DefaultPrng.init(49);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const token = try client.requestKeepalive();
+    try consumeKeepaliveTestPacket(&client);
+    client.session.is_rekeying = true;
+    client.session.rekey_resume_state = .ChannelActive;
+    client.session.setSessionState(.KexInitRead);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+    try std.testing.expectEqual(SessionState.KexInitRead, client.session.sessionState);
+    try std.testing.expect(client.session.is_rekeying);
+}
+
+test "keepalive rejects unsolicited replies and replies to unframed requests" {
+    for ([_]bool{ false, true }) |queued| {
+        for ([_]Protocol.MsgId{ .SSH_MSG_REQUEST_SUCCESS, .SSH_MSG_REQUEST_FAILURE }) |reply| {
+            var prng = std.Random.DefaultPrng.init(50);
+            var client = try keepaliveTestClient(prng.random());
+            defer client.deinit();
+            var token: ?Sshz.KeepaliveToken = null;
+            if (queued) {
+                client.session.is_rekeying = true;
+                client.session.setSessionState(.KexInitRead);
+                token = try client.requestKeepalive();
+            }
+            try std.testing.expectError(IoError.UnexpectedResponse, feedKeepaliveTestPayload(&client, &.{@intFromEnum(reply)}));
+            try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+            if (token) |id| try std.testing.expect((try client.keepaliveStatus(id)).outcome == .Disconnected);
+        }
+    }
+}
+
+test "keepalive disconnect and deadline teardown terminate pending observation" {
+    for ([_]bool{ false, true }) |deadline| {
+        var prng = std.Random.DefaultPrng.init(51);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const token = try client.requestKeepalive();
+        try consumeKeepaliveTestPacket(&client);
+        if (deadline) {
+            client.limits.deadlines.idle = 1;
+            try client.initializeDeadlines(0);
+            try std.testing.expectEqual(Sshz.TimeoutOutcome.Idle, (try client.tick(1)).?);
+        } else {
+            var payload: [64]u8 = undefined;
+            var writer = BufferWriter.init(&payload, 0);
+            try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+            try writer.writeU32(11);
+            try writer.writeU32LenString("closed");
+            try writer.writeU32LenString("");
+            try feedKeepaliveTestPayload(&client, writer.active());
+            const event = (try client.getNextEvent()).Event;
+            try std.testing.expectEqualStrings("closed", event.EndSession.ServerDisconnect.description);
+        }
+        const status = try client.keepaliveStatus(token);
+        try std.testing.expect(status.outcome == .Disconnected);
+        try std.testing.expectError(IoError.SessionTerminated, client.requestKeepalive());
+        try std.testing.expectError(IoError.SessionTerminated, client.markKeepaliveFlushed(token));
+        try client.clearKeepalive(token);
+        client.deinit();
+        try std.testing.expect(status.outcome == .Disconnected);
+    }
+}
+
+test "keepalive tokens never wrap and pre-authentication is not ready" {
+    var prng = std.Random.DefaultPrng.init(52);
+    var client = try SshzClient.init(prng.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try std.testing.expectError(IoError.NotReady, client.requestKeepalive());
+    client.session.user_authenticated = true;
+    client.session.last_keepalive_id = std.math.maxInt(u64);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.requestKeepalive());
+    try std.testing.expect(client.session.pending_global_request == null);
+    try std.testing.expect(client.session.keepalive == null);
+}
+
 test "handlePacket: request success maps allocated tcpip-forward port" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -4202,6 +4765,7 @@ test "handlePacket: request success maps allocated tcpip-forward port" {
     m.session.encrypted = false;
     m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
     try m.requestRemoteForward("127.0.0.1", 0);
     try m.consumed(m.wr_nbytes);
 
@@ -4235,6 +4799,7 @@ test "handlePacket: request failure maps cancel-tcpip-forward failure" {
     m.session.encrypted = false;
     m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
     try m.cancelRemoteForward("127.0.0.1", 2200);
     try m.consumed(m.wr_nbytes);
 

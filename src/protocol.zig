@@ -384,6 +384,7 @@ pub const IoSessionState = union(enum) {
     VersionReadLineChar: []const u8,
     VersionReadLineCompletion: []const u8,
     WriteCompletePreserveState,
+    GlobalRequestWriteComplete,
     ChannelWriteComplete: u32,
     ChannelControlComplete: u32,
     ReadPktHdr,

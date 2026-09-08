@@ -306,3 +306,185 @@ test "production client pump is compile-checked without network I/O" {
         try pumpOnce(&client, &config, transport, &scratch, .{ .writable = true }, 0),
     );
 }
+
+fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
+    const Loopback = struct {
+        // Model stream-accepted bytes waiting for the peer to read, not an
+        // adapter's unsent output queue.
+        to_server: [16384]u8 = undefined,
+        to_server_len: usize = 0,
+        to_client: [16384]u8 = undefined,
+        to_client_len: usize = 0,
+        bytes_written: usize = 0,
+        bytes_read: usize = 0,
+
+        fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
+            return true;
+        }
+
+        fn data(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedChannelData;
+        }
+
+        fn extendedData(_: *anyopaque, _: u32, _: []const u8) !void {
+            return error.UnexpectedChannelData;
+        }
+
+        fn read(context: *anyopaque, destination: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const count = @min(7, destination.len, self.to_client_len);
+            @memcpy(destination[0..count], self.to_client[0..count]);
+            std.mem.copyForwards(u8, &self.to_client, self.to_client[count..self.to_client_len]);
+            self.to_client_len -= count;
+            self.bytes_read += count;
+            return count;
+        }
+
+        fn write(context: *anyopaque, bytes: []const u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const count = @min(7, bytes.len, self.to_server.len - self.to_server_len);
+            @memcpy(self.to_server[self.to_server_len..][0..count], bytes[0..count]);
+            self.to_server_len += count;
+            self.bytes_written += count;
+            return count;
+        }
+
+        fn close(_: *anyopaque) void {}
+    };
+
+    var random = std.Random.DefaultPrng.init(2);
+    var server = try sshz.SshzServer.init(
+        random.random(),
+        @embedFile("production_test_host_key"),
+        std.testing.allocator,
+    );
+    defer server.deinit();
+    var loopback: Loopback = .{};
+    const config: Config = .{
+        .username = "test",
+        .endpoint = "example.invalid:22",
+        .command = "true",
+        .limits = .{
+            .deadlines = .{ .handshake = 3000, .authentication = 3000, .idle = 3000, .total_session = 3000 },
+            .key_lifetime = .{ .rekey_after_monotonic_ticks = 3000 },
+        },
+        .host_keys = .{ .context = &loopback, .verify_fn = Loopback.verify },
+        .credentials = .{ .context = &loopback },
+        .sink = .{ .context = &loopback, .data_fn = Loopback.data, .extended_data_fn = Loopback.extendedData },
+    };
+    const transport: common.Transport = .{
+        .context = &loopback,
+        .read_fn = Loopback.read,
+        .write_fn = Loopback.write,
+        .close_fn = Loopback.close,
+    };
+    var client = try init(random.random(), std.testing.allocator, &config, 0);
+    defer client.deinit();
+    try client.setTryNoneAuth(true);
+    var scratch: [64]u8 = undefined;
+    var token: ?sshz.KeepaliveToken = null;
+    var saw_partial = false;
+    var command_requested = false;
+    var shutdown_queued = false;
+    var handoff_written: ?usize = null;
+    var control_bytes: usize = 0;
+    var reads_before_probe: usize = 0;
+    for (0..2000) |step| {
+        switch (try server.getNextEvent()) {
+            .ReadyToConsume => |n| {
+                const count = @min(n, loopback.to_server_len);
+                if (count != 0) {
+                    try server.write(loopback.to_server[0..count]);
+                    std.mem.copyForwards(u8, &loopback.to_server, loopback.to_server[count..loopback.to_server_len]);
+                    loopback.to_server_len -= count;
+                }
+            },
+            .ReadyToProduce, .ReadyToConsumeAndProduce => {
+                const bytes = try server.peek(loopback.to_client.len - loopback.to_client_len);
+                const count = bytes.len;
+                @memcpy(loopback.to_client[loopback.to_client_len..][0..count], bytes);
+                loopback.to_client_len += count;
+                try server.consumed(count);
+            },
+            .Event => |event| switch (event) {
+                .UserAuth => try server.decideUserAuth(.Allow),
+                .ChannelOpenRequest => |request| try server.acceptChannelOpen(request.channel),
+                .Connected => try server.clearEvent(event),
+                .ChannelRequest => |request| {
+                    if (request.request == .Exec) command_requested = true;
+                    try server.clearEvent(event);
+                },
+                else => return error.UnexpectedServerEvent,
+            },
+        }
+        _ = try pumpOnce(&client, &config, transport, &scratch, .{
+            .readable = loopback.to_client_len != 0 and (shutdown == null or token == null),
+            .writable = loopback.to_server_len < loopback.to_server.len,
+        }, step);
+        if (token) |id| {
+            var status = try client.keepaliveStatus(id);
+            if (status.transmission == .Emitting) saw_partial = true;
+            if (shutdown) |control| {
+                if (status.transmission == .Emitting and !shutdown_queued) {
+                    const channel = client.automaticSessionChannelId().?;
+                    switch (control) {
+                        .Eof => try client.sendChannelEof(channel),
+                        .Close => try client.sendChannelClose(channel),
+                    }
+                    try client.cancelKeepalive(id);
+                    shutdown_queued = true;
+                    status = try client.keepaliveStatus(id);
+                }
+            }
+            if (status.transmission == .HandedToTransport and !status.transport_flushed) {
+                // This adapter writes directly to the peer, without an unsent
+                // queue. Buffered adapters must wait for their own watermark.
+                try client.markKeepaliveFlushed(id);
+                status = try client.keepaliveStatus(id);
+            }
+            if (shutdown) |control| {
+                if (status.transmission == .HandedToTransport) {
+                    try std.testing.expect(shutdown_queued);
+                    try std.testing.expect(status.outcome == .Cancelled);
+                    try std.testing.expectEqual(reads_before_probe, loopback.bytes_read);
+                    if (handoff_written) |written| {
+                        if (loopback.bytes_written - written == control_bytes) {
+                            if (control == .Eof) {
+                                try std.testing.expect(try client.channelEofFlushed(client.automaticSessionChannelId().?));
+                            }
+                            try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+                            return;
+                        }
+                    } else {
+                        const next = try client.getNextEvent();
+                        try std.testing.expect(next == .ReadyToConsumeAndProduce);
+                        control_bytes = next.ReadyToConsumeAndProduce.produce;
+                        try std.testing.expect(control_bytes > 0);
+                        handoff_written = loopback.bytes_written;
+                    }
+                }
+                continue;
+            }
+            if (status.outcome == .Acknowledged) {
+                try std.testing.expect(saw_partial);
+                try std.testing.expect(status.transport_flushed);
+                try std.testing.expectEqual(sshz.KeepaliveReply.Failure, status.outcome.Acknowledged);
+                try client.clearKeepalive(id);
+                return;
+            }
+        } else if (command_requested and client.isActive() and client.automaticSessionChannelId() != null) {
+            token = try client.requestKeepalive();
+            reads_before_probe = loopback.bytes_read;
+        }
+    }
+    return error.KeepaliveNotAcknowledged;
+}
+
+test "production pump explicitly observes keepalive after partial direct transport writes" {
+    try exerciseProductionKeepalive(null);
+}
+
+test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {
+    try exerciseProductionKeepalive(.Eof);
+    try exerciseProductionKeepalive(.Close);
+}
