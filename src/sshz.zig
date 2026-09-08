@@ -1402,11 +1402,7 @@ pub fn SshzImpl(role: Role) type {
                     switch (iotype.action) {
                         .Consuming => |target_size| {
                             TRACE(.Debug, "getIoReq Consuming target_size={d} iobuf_rd.len={d} rd_nbytes={d}", .{ target_size, self.iobuf_rd.len, self.rd_nbytes });
-                            if (target_size > self.iobuf_rd.len - self.rd_nbytes) {
-                                can_consume.* = self.iobuf_rd.len - self.rd_nbytes;
-                            } else {
-                                can_consume.* = target_size - self.rd_nbytes;
-                            }
+                            can_consume.* = try self.pendingReadSize(target_size);
                         },
                         else => {},
                     }
@@ -1431,6 +1427,19 @@ pub fn SshzImpl(role: Role) type {
             }
         }
 
+        fn pendingReadSize(self: *Self, target_size: usize) SshzError!usize {
+            // Both counts exclude the prefix at rd_off. A valid segment fits
+            // there in full; clamping an invalid one would leave it stalled.
+            if (self.rd_off > self.iobuf_rd.len or
+                target_size > self.iobuf_rd.len - self.rd_off or
+                self.rd_nbytes >= target_size)
+            {
+                self.failClosed();
+                return IoError.InvalidPacketSize;
+            }
+            return target_size - self.rd_nbytes;
+        }
+
         pub fn write(self: *Self, wbuf: []const u8) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "sshz.write len={d} .rd_nbytes={d}", .{ wbuf.len, self.rd_nbytes });
@@ -1438,7 +1447,7 @@ pub fn SshzImpl(role: Role) type {
                 .Active => |iotype| {
                     switch (iotype.action) {
                         .Consuming => |target_size| {
-                            if (wbuf.len > target_size - self.rd_nbytes) {
+                            if (wbuf.len > try self.pendingReadSize(target_size)) {
                                 return IoError.cannotAcceptWrite;
                             }
 
@@ -3585,6 +3594,73 @@ test "requestRead sets iostate_rd, leaves iostate_wr unchanged" {
     try std.testing.expectEqual(IoState(.Client).Idle, m.iostate_wr);
     try std.testing.expectEqual(@as(usize, 0), m.rd_nbytes);
     try std.testing.expectEqual(@as(usize, 0), m.rd_off);
+}
+
+test "client and server pending reads respect offsets through the final buffer byte" {
+    inline for (.{ Role.Client, Role.Server }) |role| {
+        var prng = std.Random.DefaultPrng.init(70);
+        var m = try SshzImpl(role).init(
+            prng.random(),
+            if (role == .Client) "test" else @import("privkey.zig").testkey_valid,
+            std.testing.allocator,
+        );
+        defer m.deinit();
+        m.session.setIoSessionState(.ReadPktHdr);
+        @memset(m.iobuf_rd[0..17], 0x55);
+        m.requestRead(17, Protocol.MaxSSHPacket - 17, .ReadPktHdr);
+        try std.testing.expectEqual(Protocol.MaxSSHPacket - 17, (try m.getNextEvent()).ReadyToConsume);
+        const data = [_]u8{0x77} ** (Protocol.MaxSSHPacket - 18);
+        try m.write(&data);
+        try std.testing.expectEqual(@as(usize, 1), (try m.getNextEvent()).ReadyToConsume);
+        try std.testing.expectError(IoError.cannotAcceptWrite, m.write("xx"));
+        try std.testing.expectEqual(@as(usize, 1), (try m.getNextEvent()).ReadyToConsume);
+        try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 17), m.iobuf_rd[0..17]);
+        try std.testing.expectEqualSlices(u8, &data, m.iobuf_rd[17 .. m.iobuf_rd.len - 1]);
+        try m.write("x");
+        // Completion must advance directly to a positive header read, never
+        // leave the exhausted body active or consume the next packet's bytes.
+        try std.testing.expectEqual(Protocol.sizeof_PktHdr, (try m.getNextEvent()).ReadyToConsume);
+        try std.testing.expect(!m.terminated);
+    }
+}
+
+test "invalid or exhausted pending reads fail closed without wrapping or stalling" {
+    const Case = struct { offset: usize, target: usize, consumed: usize = 0 };
+    const cases = [_]Case{
+        .{ .offset = 0, .target = 0 },
+        .{ .offset = 5, .target = 8, .consumed = 8 },
+        .{ .offset = 5, .target = 8, .consumed = 9 },
+        .{ .offset = 5, .target = 8, .consumed = std.math.maxInt(usize) },
+        .{ .offset = Protocol.MaxSSHPacket, .target = 0 },
+        .{ .offset = Protocol.MaxSSHPacket, .target = 1 },
+        .{ .offset = Protocol.MaxSSHPacket + 1, .target = 1 },
+        .{ .offset = 17, .target = Protocol.MaxSSHPacket - 16 },
+        .{ .offset = 1, .target = std.math.maxInt(usize) },
+    };
+    inline for (.{ Role.Client, Role.Server }) |role| {
+        for (cases) |case| {
+            for ([_]bool{ false, true }) |write_first| {
+                var prng = std.Random.DefaultPrng.init(71);
+                var m = try SshzImpl(role).init(
+                    prng.random(),
+                    if (role == .Client) "test" else @import("privkey.zig").testkey_valid,
+                    std.testing.allocator,
+                );
+                defer m.deinit();
+                m.session.setIoSessionState(.ReadPktHdr);
+                m.requestRead(case.offset, case.target, .ReadPktHdr);
+                m.rd_nbytes = case.consumed;
+                if (write_first) {
+                    try std.testing.expectError(IoError.InvalidPacketSize, m.write("x"));
+                } else {
+                    try std.testing.expectError(IoError.InvalidPacketSize, m.getNextEvent());
+                }
+                try std.testing.expect(m.terminated);
+                try std.testing.expectError(IoError.SessionTerminated, m.getNextEvent());
+                try std.testing.expectError(IoError.SessionTerminated, m.write("x"));
+            }
+        }
+    }
 }
 
 test "requestWrite sets iostate_wr, leaves iostate_rd unchanged" {

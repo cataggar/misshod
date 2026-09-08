@@ -312,10 +312,11 @@ const ProductionTestTransport = struct {
     // adapter's unsent output queue.
     to_server: [16384]u8 = undefined,
     to_server_len: usize = 0,
-    to_client: [16384]u8 = undefined,
+    to_client: [3 * sshz.ResourceCapacities.packet_size]u8 = undefined,
     to_client_len: usize = 0,
     bytes_written: usize = 0,
     bytes_read: usize = 0,
+    read_limit: usize = 7,
 
     fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
         return true;
@@ -331,7 +332,7 @@ const ProductionTestTransport = struct {
 
     fn read(context: *anyopaque, destination: []u8) !usize {
         const self: *@This() = @ptrCast(@alignCast(context));
-        const count = @min(7, destination.len, self.to_client_len);
+        const count = @min(self.read_limit, destination.len, self.to_client_len);
         @memcpy(destination[0..count], self.to_client[0..count]);
         std.mem.copyForwards(u8, &self.to_client, self.to_client[count..self.to_client_len]);
         self.to_client_len -= count;
@@ -483,6 +484,152 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
 
 test "production pump explicitly observes keepalive after partial direct transport writes" {
     try exerciseProductionKeepalive(null);
+}
+
+test "production pump bounds large encrypted coalesced packets to the current read" {
+    const Loopback = ProductionTestTransport;
+    const sizes = [_]usize{ 32768, sshz.ResourceCapacities.channel_packet_size, 17 };
+    const Delivery = struct {
+        expected: []const u8,
+        messages: usize = 0,
+
+        fn data(context: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(self.messages < sizes.len);
+            try std.testing.expectEqualSlices(u8, self.expected[0..sizes[self.messages]], bytes);
+            self.messages += 1;
+        }
+    };
+    var random = std.Random.DefaultPrng.init(69);
+    var payload: [sshz.ResourceCapacities.channel_packet_size]u8 = undefined;
+    random.random().bytes(&payload);
+    var delivery: Delivery = .{ .expected = &payload };
+    var server = try sshz.SshzServer.init(
+        random.random(),
+        @embedFile("production_test_host_key"),
+        std.testing.allocator,
+    );
+    defer server.deinit();
+    var loopback: Loopback = .{};
+    const config: Config = .{
+        .username = "test",
+        .endpoint = "example.invalid:22",
+        .command = "true",
+        .limits = .{
+            .deadlines = .{ .handshake = 3000, .authentication = 3000, .idle = 3000, .total_session = 3000 },
+            .key_lifetime = .{ .rekey_after_monotonic_ticks = 3000 },
+        },
+        .host_keys = .{ .context = &loopback, .verify_fn = Loopback.verify },
+        .credentials = .{ .context = &loopback },
+        .sink = .{ .context = &delivery, .data_fn = Delivery.data, .extended_data_fn = Loopback.extendedData },
+    };
+    const transport: common.Transport = .{
+        .context = &loopback,
+        .read_fn = Loopback.read,
+        .write_fn = Loopback.write,
+        .close_fn = Loopback.close,
+    };
+    var client = try init(random.random(), std.testing.allocator, &config, 0);
+    defer client.deinit();
+    try client.setTryNoneAuth(true);
+    var scratch: [32768]u8 = undefined;
+    var channel: ?u32 = null;
+    var sending = false;
+    var sent: usize = 0;
+    var packet_sizes: [sizes.len]usize = undefined;
+    var batch_start: usize = 0;
+    var initial_keys: ?sshz.KeyEpochStatus = null;
+    var saw_partial_bodies: usize = 0;
+    for (0..2000) |step| {
+        switch (try server.getNextEvent()) {
+            .ReadyToConsume => |n| {
+                const count = @min(n, loopback.to_server_len);
+                if (count != 0) {
+                    try server.write(loopback.to_server[0..count]);
+                    std.mem.copyForwards(u8, &loopback.to_server, loopback.to_server[count..loopback.to_server_len]);
+                    loopback.to_server_len -= count;
+                } else if (channel != null and sent < sizes.len) {
+                    const buffer = try server.getChannelWriteBuffer(channel.?);
+                    @memcpy(buffer[0..sizes[sent]], payload[0..sizes[sent]]);
+                    try server.channelWriteComplete(channel.?, sizes[sent]);
+                    sending = true;
+                }
+            },
+            .ReadyToProduce, .ReadyToConsumeAndProduce => {
+                const bytes = try server.peek(loopback.to_client.len - loopback.to_client_len);
+                const count = bytes.len;
+                try std.testing.expect(count > 0);
+                @memcpy(loopback.to_client[loopback.to_client_len..][0..count], bytes);
+                loopback.to_client_len += count;
+                try server.consumed(count);
+                if (sending) {
+                    packet_sizes[sent] = count;
+                    sent += 1;
+                    sending = false;
+                }
+            },
+            .Event => |event| switch (event) {
+                .UserAuth => try server.decideUserAuth(.Allow),
+                .ChannelOpenRequest => |request| try server.acceptChannelOpen(request.channel),
+                .Connected => try server.clearEvent(event),
+                .ChannelRequest => |request| {
+                    if (request.request == .Exec) {
+                        channel = request.channel;
+                        try std.testing.expectEqual(@as(usize, 0), loopback.to_client_len);
+                        batch_start = loopback.bytes_read;
+                        initial_keys = client.keyLifetimeStatus().inbound;
+                    }
+                    try server.clearEvent(event);
+                },
+                else => return error.UnexpectedServerEvent,
+            },
+        }
+        if (sent == sizes.len) {
+            loopback.read_limit = scratch.len;
+            const next = try client.getNextEvent();
+            const requested = switch (next) {
+                .ReadyToConsume => |n| n,
+                .ReadyToConsumeAndProduce => |counts| counts.consume,
+                else => null,
+            };
+            if (requested) |n| {
+                var packet_offset = loopback.bytes_read - batch_start;
+                for (packet_sizes) |packet_size| {
+                    if (packet_offset >= packet_size) {
+                        packet_offset -= packet_size;
+                        continue;
+                    }
+                    // AES-CTR first reads its 16-byte block, then the remaining
+                    // encrypted body and MAC. Coalesced packets stay upstream.
+                    const expected = if (packet_offset < 16) 16 - packet_offset else packet_size - packet_offset;
+                    try std.testing.expect(n > 0);
+                    try std.testing.expectEqual(expected, n);
+                    if (packet_offset == 16 + scratch.len) saw_partial_bodies += 1;
+                    break;
+                }
+            }
+        }
+        _ = try pumpOnce(&client, &config, transport, &scratch, .{
+            .readable = loopback.to_client_len != 0 and (channel == null or sent == sizes.len),
+            .writable = loopback.to_server_len < loopback.to_server.len,
+        }, step);
+        if (delivery.messages == sizes.len) {
+            try std.testing.expectEqual(@as(usize, 2), saw_partial_bodies);
+            try std.testing.expectEqual(@as(usize, 0), loopback.to_client_len);
+            try std.testing.expect(packet_sizes[0] > 16 + scratch.len);
+            try std.testing.expect(packet_sizes[1] > 16 + scratch.len);
+            var total: usize = 0;
+            for (packet_sizes) |size| total += size;
+            try std.testing.expectEqual(total, loopback.bytes_read - batch_start);
+            const keys = client.keyLifetimeStatus().inbound;
+            try std.testing.expectEqual(initial_keys.?.epoch, keys.epoch);
+            try std.testing.expectEqual(initial_keys.?.encrypted_packets + sizes.len, keys.encrypted_packets);
+            try std.testing.expectEqual(initial_keys.?.next_sequence_number + sizes.len, keys.next_sequence_number);
+            try std.testing.expect(client.isActive());
+            return;
+        }
+    }
+    return error.CoalescedPacketsNotDelivered;
 }
 
 test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {

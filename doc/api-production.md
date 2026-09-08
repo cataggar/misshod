@@ -81,7 +81,13 @@ exactly the returned requirement:
 | `error.NotReady` | Wait for transport readiness, a deadline tick, or application work; do not spin. |
 
 `write()` copies input before returning and accepts partial fulfillment of the
-announced amount. Never pass more than the current requirement.
+announced amount. For both roles, the advertised consume count is the remaining
+bytes in the current incremental read (identification, packet header, or packet
+body including its MAC), not spare packet-buffer capacity. After a partial
+`write()`, query readiness again or subtract the accepted count; after completing
+a requirement, query again before consuming more stream bytes. A coalesced
+following packet must remain in the transport or caller-owned input buffer until
+requested. Never pass more than the current requirement.
 `peek()` returns borrowed session storage. Keep it only through the transport
 write and call `consumed()` with the exact count actually written, including
 partial writes; never mutate or retain the slice. Do not call `consumed()` for

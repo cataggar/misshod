@@ -29,6 +29,10 @@ zig build production-examples
 See [getting started](doc/getting-started.md) for library commands and the
 `sshz` and `sshzd` demo programs.
 
+For either role, consume-readiness counts cover only the current incremental
+read. Leave coalesced following packets in the transport or your own input
+buffer until requested; see the [transport pump contract](doc/api-production.md#the-transport-pump).
+
 ## Documentation
 
 - [Production-facing API and lifecycle](doc/api-production.md)
