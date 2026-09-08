@@ -1566,6 +1566,22 @@ pub const Session = struct {
         return chan;
     }
 
+    pub fn discardUnframedChannelWrite(self: *Self, channel_id: u32, sshz: *SshzClient) SshzError!usize {
+        if (self.global_requests_ended) return IoError.SessionTerminated;
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (!chan.remote_id_known or chan.close_sent or chan.close_received) return IoError.UnexpectedResponse;
+        switch (chan.state) {
+            .Data, .DataRx, .DataTx, .DataTxComplete => {},
+            else => return IoError.UnexpectedResponse,
+        }
+        const discarded = chan.discardUnframedWriteBuffer();
+        // Removing a window-blocked suffix can make an earlier EOF runnable.
+        // Do not bypass a received packet, rekey, or an occupied write side.
+        if (self.ioSessionState != .ReadPktCompletion)
+            _ = try self.startPendingChannelControl(chan, sshz, &self.keydata.c2s);
+        return discarded;
+    }
+
     // Full-duplex: build and send channel data packet directly without going through state machine
     pub fn directChannelWrite(self: *Self, channel_id: u32, nbytes: usize, sshz: *SshzClient) SshzError!void {
         const chan = try self.queueChannelWrite(channel_id, nbytes);
@@ -5836,6 +5852,236 @@ test "client direct write retains suffix across peer packet and window limits" {
     try std.testing.expectError(IoError.UnexpectedResponse, m.channelEofFlushed(9999));
     try std.testing.expectEqual(@as(usize, 0), (try m.getChannelWriteBuffer(chan.local_id)).len);
     try std.testing.expectError(IoError.UnexpectedResponse, m.channelWriteComplete(chan.local_id, 1));
+}
+
+fn submitDiscardTestData(client: *SshzClient, channel_id: u32, bytes: []const u8) !void {
+    const destination = try client.getChannelWriteBuffer(channel_id);
+    try std.testing.expect(destination.len >= bytes.len);
+    @memcpy(destination[0..bytes.len], bytes);
+    try client.channelWriteComplete(channel_id, bytes.len);
+}
+
+test "discard unframed writes releases bounded storage and isolates channels at zero peer window" {
+    const limits = Sshz.ResourceLimits{
+        .max_channel_buffered_data = 8,
+        .max_pending_buffered_data = 12,
+    };
+    var prng = std.Random.DefaultPrng.init(60);
+    var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer client.deinit();
+    client.session.user_authenticated = true;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    const first = client.session.channel_table.allocChannel(10, 0, 8).?;
+    const second = client.session.channel_table.allocChannel(20, 0, 8).?;
+    first.state = .DataRx;
+    second.state = .DataRx;
+    _ = try client.getNextEvent();
+    try submitDiscardTestData(&client, first.local_id, "discard!");
+    try submitDiscardTestData(&client, second.local_id, "kept");
+    const keys = client.keyLifetimeStatus();
+    const read = client.iostate_rd;
+    const local_window = first.local_window;
+    try std.testing.expectEqual(@as(usize, 12), client.session.pendingBufferedData());
+    try std.testing.expectEqual(@as(usize, 8), try client.discardUnframedChannelWrite(first.local_id));
+    try std.testing.expectEqual(@as(usize, 0), try client.discardUnframedChannelWrite(first.local_id));
+    try std.testing.expectEqual(@as(usize, 4), client.session.pendingBufferedData());
+    try std.testing.expectEqualStrings("kept", second.write_buf[0..second.write_buf_nbytes]);
+    try std.testing.expectEqual(@as(u32, 0), second.peer_window);
+    try std.testing.expectEqual(ChannelState.DataRx, second.state);
+    try std.testing.expectEqual(local_window, first.local_window);
+    try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+    try std.testing.expectEqualDeep(read, client.iostate_rd);
+    try std.testing.expect(!first.close_pending and !first.eof_pending);
+    for (first.write_buf[0..8]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    // A fresh borrow can submit new data; the previous borrow must not be reused.
+    try submitDiscardTestData(&client, first.local_id, "new-data");
+    try std.testing.expectEqual(@as(usize, 12), client.session.pendingBufferedData());
+}
+
+test "discard unframed suffix preserves framed prefix partial ciphertext and peer window" {
+    for ([_]bool{ false, true }) |encrypted| {
+        var prng = std.Random.DefaultPrng.init(61);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        if (encrypted) {
+            try client.session.keydata.genKeys(.{1} ** 32, .{2} ** 32, .{3} ** 32);
+            client.session.encrypted = true;
+        }
+        const channel = client.session.channel_table.allocChannel(10, 12, 4).?;
+        channel.state = .DataRx;
+        _ = try client.getNextEvent();
+        try submitDiscardTestData(&client, channel.local_id, "keepsuffix");
+        try client.consumed(1);
+        var ciphertext: [128]u8 = undefined;
+        const packet = try client.peek(ciphertext.len);
+        const len = packet.len;
+        @memcpy(ciphertext[0..len], packet);
+        const keys = client.keyLifetimeStatus();
+        const read = client.iostate_rd;
+        try std.testing.expectEqual(@as(usize, 6), try client.discardUnframedChannelWrite(channel.local_id));
+        try std.testing.expectEqual(@as(usize, 0), try client.discardUnframedChannelWrite(channel.local_id));
+        try std.testing.expectEqual(@as(usize, 4), channel.tx_in_flight_len);
+        try std.testing.expectEqual(@as(usize, 4), channel.write_buf_nbytes);
+        try std.testing.expectEqual(@as(usize, 4), client.session.pendingBufferedData());
+        try std.testing.expectEqualStrings("keep", channel.write_buf[0..4]);
+        for (channel.write_buf[4..10]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+        try std.testing.expectEqual(@as(u32, 8), channel.peer_window);
+        try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+        try std.testing.expectEqualDeep(read, client.iostate_rd);
+        try std.testing.expectEqualSlices(u8, ciphertext[0..len], try client.peek(ciphertext.len));
+        try std.testing.expectEqual(@as(usize, 0), (try client.getChannelWriteBuffer(channel.local_id)).len);
+        try client.consumed(len);
+        try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+        try std.testing.expectEqual(@as(usize, 0), channel.tx_in_flight_len);
+        try std.testing.expectEqual(@as(usize, 0), channel.write_buf_nbytes);
+        try submitDiscardTestData(&client, channel.local_id, "next");
+        try std.testing.expectEqual(@as(usize, 0), try client.discardUnframedChannelWrite(channel.local_id));
+        try std.testing.expectEqual(@as(usize, 4), channel.tx_in_flight_len);
+    }
+}
+
+test "discard unframed writes during rekey neither sends nor changes key state" {
+    var prng = std.Random.DefaultPrng.init(62);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(10, 12, 4).?;
+    channel.state = .DataRx;
+    client.session.is_rekeying = true;
+    client.session.setSessionState(.KexInitRead);
+    _ = try client.getNextEvent();
+    try submitDiscardTestData(&client, channel.local_id, "discard");
+    const keys = client.keyLifetimeStatus();
+    try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel.local_id));
+    try std.testing.expectEqualDeep(keys, client.keyLifetimeStatus());
+    try std.testing.expectEqual(@as(u32, 12), channel.peer_window);
+    try std.testing.expectEqual(@as(usize, 0), channel.tx_in_flight_len);
+    try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+    client.session.is_rekeying = false;
+    client.session.setSessionState(.ChannelActive);
+    try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+    try submitDiscardTestData(&client, channel.local_id, "new");
+}
+
+test "discard unframed suffix preserves queued EOF and CLOSE after partial data output" {
+    for ([_]ChannelControl{ .Eof, .Close }) |control| {
+        var prng = std.Random.DefaultPrng.init(63);
+        var client = try keepaliveTestClient(prng.random());
+        defer client.deinit();
+        const channel = client.session.channel_table.allocChannel(10, 4, 4).?;
+        channel.state = .DataRx;
+        _ = try client.getNextEvent();
+        try submitDiscardTestData(&client, channel.local_id, "keepsuffix");
+        try client.consumed(1);
+        switch (control) {
+            .Eof => try client.sendChannelEof(channel.local_id),
+            .Close => try client.sendChannelClose(channel.local_id),
+        }
+        try std.testing.expectEqual(@as(usize, 6), try client.discardUnframedChannelWrite(channel.local_id));
+        try consumeKeepaliveTestPacket(&client);
+        const packet = try client.peek(128);
+        var reader = BufferReader.init(unencryptedPayload(packet));
+        try std.testing.expectEqual(@intFromEnum(switch (control) {
+            .Eof => Protocol.MsgId.SSH_MSG_CHANNEL_EOF,
+            .Close => Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE,
+        }), try reader.readU8());
+        try std.testing.expectEqual(@as(u32, 10), try reader.readU32());
+        try client.consumed(packet.len);
+        if (control == .Eof) try std.testing.expect(try client.channelEofFlushed(channel.local_id));
+        try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+    }
+}
+
+test "discard window-blocked write releases EOF without waiting for input" {
+    var prng = std.Random.DefaultPrng.init(64);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(10, 0, 4).?;
+    channel.state = .DataRx;
+    _ = try client.getNextEvent();
+    try submitDiscardTestData(&client, channel.local_id, "discard");
+    try client.sendChannelEof(channel.local_id);
+    try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel.local_id));
+    try std.testing.expect((try client.getNextEvent()) == .ReadyToConsumeAndProduce);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(try client.channelEofFlushed(channel.local_id));
+}
+
+test "discard unframed write preserves an active keepalive partial read and later EOF" {
+    var prng = std.Random.DefaultPrng.init(65);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(10, 0, 4).?;
+    channel.state = .DataRx;
+    var packet: [64]u8 = undefined;
+    const len = buildUnencryptedPacket(&packet, &.{ @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE), 0, 0, 0, 1, 'x' });
+    try feedKeepaliveTestBytes(&client, packet[0 .. Protocol.sizeof_PktHdr + 1]);
+    try submitDiscardTestData(&client, channel.local_id, "discard");
+    const token = try client.requestKeepalive();
+    try client.consumed(1);
+    try client.sendChannelEof(channel.local_id);
+    var outgoing: [128]u8 = undefined;
+    const bytes = try client.peek(outgoing.len);
+    const outgoing_len = bytes.len;
+    @memcpy(outgoing[0..bytes.len], bytes);
+    const before = try client.keepaliveStatus(token);
+    const read = client.iostate_rd;
+    try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel.local_id));
+    try std.testing.expectEqualDeep(before, try client.keepaliveStatus(token));
+    try std.testing.expectEqualDeep(read, client.iostate_rd);
+    try std.testing.expectEqualSlices(u8, outgoing[0..outgoing_len], try client.peek(outgoing.len));
+    try consumeKeepaliveTestPacket(&client);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(try client.channelEofFlushed(channel.local_id));
+    try feedKeepaliveTestBytes(&client, packet[Protocol.sizeof_PktHdr + 1 .. len]);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+}
+
+test "discard unframed write rejects unknown opening closed and server channels" {
+    var prng = std.Random.DefaultPrng.init(66);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    try std.testing.expectError(IoError.UnexpectedResponse, client.discardUnframedChannelWrite(123));
+    const channel = client.session.channel_table.allocChannel(10, 4, 4).?;
+    try std.testing.expectError(IoError.UnexpectedResponse, client.discardUnframedChannelWrite(channel.local_id));
+    channel.state = .Closed;
+    try std.testing.expectError(IoError.UnexpectedResponse, client.discardUnframedChannelWrite(channel.local_id));
+    channel.state = .DataRx;
+    channel.close_sent = true;
+    try std.testing.expectError(IoError.UnexpectedResponse, client.discardUnframedChannelWrite(channel.local_id));
+    channel.close_sent = false;
+    channel.close_received = true;
+    try std.testing.expectError(IoError.UnexpectedResponse, client.discardUnframedChannelWrite(channel.local_id));
+    client.deinit();
+    try std.testing.expectError(IoError.SessionTerminated, client.discardUnframedChannelWrite(0));
+    var server = try Sshz.SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer server.deinit();
+    try std.testing.expectError(IoError.UnimplementedService, server.discardUnframedChannelWrite(0));
+}
+
+test "discard unframed write does not clear or overwrite a borrowed receive event" {
+    var prng = std.Random.DefaultPrng.init(67);
+    var client = try keepaliveTestClient(prng.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(10, 0, 4).?;
+    channel.state = .DataRx;
+    _ = try client.getNextEvent();
+    try submitDiscardTestData(&client, channel.local_id, "discard");
+    var payload: [64]u8 = undefined;
+    var writer = BufferWriter.init(&payload, 0);
+    try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try writer.writeU32(channel.local_id);
+    try writer.writeU32LenString("received");
+    try feedKeepaliveTestPayload(&client, writer.active());
+    const event = (try client.getNextEvent()).Event;
+    try client.sendChannelEof(channel.local_id);
+    try std.testing.expectEqual(@as(usize, 7), try client.discardUnframedChannelWrite(channel.local_id));
+    try std.testing.expectEqualStrings("received", event.RxData.data);
+    try std.testing.expectEqualDeep(event, (try client.getNextEvent()).Event);
+    try client.clearEvent(event);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(try client.channelEofFlushed(channel.local_id));
 }
 
 test "automatic session ends after session channel closes before agent channel" {

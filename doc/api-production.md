@@ -104,6 +104,44 @@ currently accept data. Inputs to channel-open/rejection APIs should
 conservatively remain alive until the corresponding open/failure output has
 been pumped because some current implementation paths retain slices.
 
+### Discarding queued client data
+
+`SshzClient.discardUnframedChannelWrite(channel_id)` returns the number of
+accepted plaintext payload bytes removed from that channel's write queue.
+It is an explicit, client-only operation; it installs no automatic policy.
+It works during rekey and with zero peer-window credit without closing the
+channel. The server role returns `UnimplementedService`.
+
+Only data accepted through `channelWriteComplete` and not yet framed is
+discarded. The discarded suffix is erased, immediately releasing its share
+of the configured pending-data budget. A framed prefix remains reserved until
+the caller finishes consuming that packet. It cannot be retracted even if
+none of the packet has reached the transport. The current packet, cipher and
+compression sequencing, peer-window charge, and unrelated channels remain
+intact. No peer credit is refunded, and bytes already handed to an
+application-owned transport queue are outside this API's ownership.
+
+Call this only after finishing any `getChannelWriteBuffer`/
+`channelWriteComplete` pair. Do not retain or resubmit a previously borrowed
+write slice across the discard. Bytes merely copied into a borrow but not
+accepted by `channelWriteComplete` are neither counted nor cancelled. Acquire
+a fresh buffer for later data; it remains empty while the framed prefix is
+in flight. Repeated discard on an open channel returns zero until more
+unframed data has been accepted.
+
+The API accepts active client channels, including forwarding channels.
+Unknown, not-yet-open, close-sent/received, and closed channels return
+`UnexpectedResponse` without changing the queue. Terminated sessions return
+`SessionTerminated`. A locally queued EOF or CLOSE is preserved, not created
+or cancelled. Removing its last unframed predecessor may make that control
+packet writable immediately, subject to existing rekey, pending-read, and
+write-side ordering. Continue pumping any framed packet normally; do not
+discard its bytes from the transport.
+
+The production client example tests this operation through its real pump
+with partial encrypted writes, exhausted peer credit, and a complete rekey.
+The peer receives only the preserved prefix and subsequently accepted data.
+
 ## Client event loop and host identity
 
 `CheckHostKey` is a mandatory trust decision emitted after the key-exchange
@@ -360,6 +398,8 @@ around backpressure.
   `InvalidKeepaliveToken` identifies a stale/released token; local
   `ResourceLimitExceeded` from a second outstanding global request or retained
   keepalive result is the documented contention case above.
+  `UnexpectedResponse` from `discardUnframedChannelWrite` identifies an invalid
+  channel lifecycle for that local operation, not newly received peer input.
   Correct the poll/accounting state; never drop or duplicate bytes.
 - `BufferError`, malformed framing/MAC, negotiation, unexpected response,
   channel-window/packet, auth/KEX/resource, host-key-change, and

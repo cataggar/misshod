@@ -194,6 +194,14 @@ pub const Channel = struct {
         self.tx_in_flight_len = 0;
     }
 
+    pub fn discardUnframedWriteBuffer(self: *Self) usize {
+        std.debug.assert(self.tx_in_flight_len <= self.write_buf_nbytes);
+        const discarded = self.write_buf_nbytes - self.tx_in_flight_len;
+        std.crypto.secureZero(u8, self.write_buf[self.tx_in_flight_len..self.write_buf_nbytes]);
+        self.write_buf_nbytes = self.tx_in_flight_len;
+        return discarded;
+    }
+
     pub fn eofFlushed(self: *const Self) bool {
         return self.eof_sent and !self.eof_pending and
             self.write_buf_nbytes == 0 and self.tx_in_flight_len == 0 and
