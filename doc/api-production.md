@@ -273,6 +273,14 @@ after authentication and returns a value-owned `KeepaliveToken`. It never
 writes channel data or installs automatic probes, a clock, deadlines, retries,
 or a connection-health policy. It is valid on an authenticated zero-channel
 client and can queue while output or rekey is in progress.
+It is also valid while automatic exec acknowledgment is pending: channel and
+global replies are independent and impose no ACK-before-probe ordering.
+
+Duplex output completion preserves current receive progress. In particular,
+finishing a queued resize must not rewind a header/body read that completed
+while the resize was partially written. The production pump regressions cover
+this overlap with encrypted ACKs, coalesced channel data, pre-acknowledgment
+probes, rekey, and direct or buffered output.
 
 Poll `keepaliveStatus(token)` for a value-owned snapshot. No new event-loop
 variant is required. The snapshot's `token`, `transmission`,
