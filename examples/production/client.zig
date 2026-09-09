@@ -352,15 +352,17 @@ const ProductionTestTransport = struct {
     fn close(_: *anyopaque) void {}
 };
 
-fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
+fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, rekey: bool) !void {
     const Loopback = ProductionTestTransport;
     var random = std.Random.DefaultPrng.init(2);
-    var server = try sshz.SshzServer.init(
+    var server = try sshz.SshzServer.initWithLimits(
         random.random(),
         @embedFile("production_test_host_key"),
         std.testing.allocator,
+        .{ .key_lifetime = .{ .rekey_after_monotonic_ticks = if (rekey) 1 else null } },
     );
     defer server.deinit();
+    try server.initializeDeadlines(0);
     var loopback: Loopback = .{};
     const config: Config = .{
         .username = "test",
@@ -383,6 +385,11 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
     var client = try init(random.random(), std.testing.allocator, &config, 0);
     defer client.deinit();
     try client.setTryNoneAuth(true);
+    try client.setAutoExecAckEnabled(exec_ack);
+    if (rekey) {
+        try client.setAutoPty("xterm", 80, 24, 640, 480);
+        try client.enableAgentForwarding();
+    }
     var scratch: [64]u8 = undefined;
     var token: ?sshz.KeepaliveToken = null;
     var saw_partial = false;
@@ -391,6 +398,8 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
     var handoff_written: ?usize = null;
     var control_bytes: usize = 0;
     var reads_before_probe: usize = 0;
+    var exec_partial = false;
+    var exec_pending_through_rekey = false;
     for (0..2000) |step| {
         switch (try server.getNextEvent()) {
             .ReadyToConsume => |n| {
@@ -413,7 +422,14 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
                 .ChannelOpenRequest => |request| try server.acceptChannelOpen(request.channel),
                 .Connected => try server.clearEvent(event),
                 .ChannelRequest => |request| {
-                    if (request.request == .Exec) command_requested = true;
+                    if (request.request == .Exec) {
+                        command_requested = true;
+                        if (exec_ack) {
+                            try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+                            try std.testing.expectEqual(.HandedToTransport, (try client.autoExecAckStatus()).transmission);
+                        }
+                        if (rekey) _ = try server.tick(2);
+                    }
                     try server.clearEvent(event);
                 },
                 else => return error.UnexpectedServerEvent,
@@ -423,6 +439,13 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
             .readable = loopback.to_client_len != 0 and (shutdown == null or token == null),
             .writable = loopback.to_server_len < loopback.to_server.len,
         }, step);
+        const exec_status = try client.autoExecAckStatus();
+        if (exec_status.transmission == .Emitting) {
+            exec_partial = true;
+            try std.testing.expectEqual(.Pending, exec_status.outcome);
+        }
+        if (client.keyLifetimeStatus().rekey_in_progress and exec_status.outcome == .Pending)
+            exec_pending_through_rekey = true;
         if (token) |id| {
             var status = try client.keepaliveStatus(id);
             if (status.transmission == .Emitting) saw_partial = true;
@@ -468,9 +491,19 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
                 continue;
             }
             if (status.outcome == .Acknowledged) {
+                if (exec_ack and exec_status.outcome == .Pending) continue;
                 try std.testing.expect(saw_partial);
                 try std.testing.expect(status.transport_flushed);
                 try std.testing.expectEqual(sshz.KeepaliveReply.Failure, status.outcome.Acknowledged);
+                if (exec_ack) {
+                    try std.testing.expect(exec_partial);
+                    try std.testing.expectEqual(.Accepted, exec_status.outcome);
+                    try std.testing.expectEqual(client.automaticSessionChannelId().?, exec_status.channel.?);
+                    if (rekey) {
+                        try std.testing.expect(exec_pending_through_rekey);
+                        try std.testing.expect(client.keyLifetimeStatus().inbound.epoch >= 2);
+                    }
+                } else try std.testing.expectEqual(.NotRequested, exec_status.outcome);
                 try client.clearKeepalive(id);
                 return;
             }
@@ -483,7 +516,12 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }) !void {
 }
 
 test "production pump explicitly observes keepalive after partial direct transport writes" {
-    try exerciseProductionKeepalive(null);
+    try exerciseProductionKeepalive(null, false, false);
+}
+
+test "production encrypted exec acknowledgment survives rekey and concurrent keepalive" {
+    try exerciseProductionKeepalive(null, true, false);
+    try exerciseProductionKeepalive(null, true, true);
 }
 
 test "production pump bounds large encrypted coalesced packets to the current read" {
@@ -633,8 +671,8 @@ test "production pump bounds large encrypted coalesced packets to the current re
 }
 
 test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {
-    try exerciseProductionKeepalive(.Eof);
-    try exerciseProductionKeepalive(.Close);
+    try exerciseProductionKeepalive(.Eof, false, false);
+    try exerciseProductionKeepalive(.Close, false, false);
 }
 
 test "production pump discards unframed data across partial writes zero window and real rekey" {

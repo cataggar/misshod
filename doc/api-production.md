@@ -21,7 +21,8 @@ The candidate production-facing surface is the `sshz` module's
 `SshzClient`, `SshzServer`, event and event-payload types,
 `ResourceLimits`, deadline/key-lifetime types, `SshOpenFailureReason`,
 `KeepaliveToken`, `KeepaliveStatus`, `KeepaliveTransmission`,
-`KeepaliveOutcome`, `KeepaliveReply`, `SshzError`, and buffer helper types.
+`KeepaliveOutcome`, `KeepaliveReply`, `AutoExecAckStatus`, `AutoExecAckOutcome`,
+`AutoExecTransmission`, `SshzError`, and buffer helper types.
 After API version 1, these names,
 their documented semantics, and default resource limits follow semantic
 versioning: source-breaking changes require a major version; additive events
@@ -204,6 +205,66 @@ results consume the configured channel capacity, another session open returns
 false, so close cannot lose its result. Open failures release their reservation
 automatically. The production client example treats status zero as success and
 reports nonzero, signal, and missing-result outcomes as terminal errors.
+
+### Observing automatic exec acceptance
+
+Call `setAutoExecAckEnabled(true)` before authentication, before or after
+`setAutoExecCommand`, to send the single automatic `exec` request with
+`want_reply=true`. The default remains false. Shell, optional PTY, and agent
+forwarding requests retain their existing flags and order. This option is
+client-only and incompatible with disabling the automatic session. Changing it
+after authentication or channel allocation returns `UnexpectedResponse`; the
+server role returns `UnimplementedService`.
+
+`autoExecAckStatus()` returns a value-owned `AutoExecAckStatus`, without a new
+event variant or borrowed storage. Its `channel` identifies the automatic
+channel once an opted-in exec's channel is allocated. There is only one such
+request per client lifetime; no retry, reset, or second reply slot is installed.
+
+| Field/state | Meaning |
+| --- | --- |
+| `outcome.NotRequested` | No opted-in automatic exec channel has been allocated; this also remains the result for legacy exec and automatic shell sessions. |
+| `outcome.Pending` | The opted-in channel exists, but no matching exec acceptance/rejection or terminal observation has occurred. Check transmission separately. |
+| `outcome.Accepted` | A matching SSH `CHANNEL_SUCCESS` (99) acknowledged the issued exec request. |
+| `outcome.Rejected` | A matching SSH `CHANNEL_FAILURE` (100) rejected the issued exec request. This is not a socket-loss classification. |
+| `outcome.EndedUnacknowledged` | Opening failed, local/remote close began, or the session ended while the acknowledgment was pending. No acceptance is inferred. |
+| `transmission.NotStarted` | The opted-in exec packet has not been framed; channel open, optional PTY/agent output, or rekey may precede it. |
+| `transmission.Emitting` | The exec packet is framed but not fully consumed, including its padding/MAC. |
+| `transmission.HandedToTransport` | The caller has consumed every byte of the exec packet. This alone proves neither network flush nor acceptance. |
+
+**`Connected` still means local automatic setup, not server exec acceptance.**
+Continue servicing normal/extended data, exit status/signal, EOF, and close
+while acknowledgment is pending. Early output or an exit result does not
+acknowledge the exec. EOF does not end acknowledgment observation: a subsequent
+valid reply before close still counts. Acceptance proves only SSH request
+acceptance, not successful execution, completion, or any application-level
+attachment or readiness.
+
+A rejection is retained independently rather than closing the channel or
+discarding output. Likewise, accepted/rejected facts survive fast command
+completion, channel removal, `EndSession`, and fail-closed cleanup. Copy the
+snapshot before destroying the client if it must outlive the object. Clearing
+an exit result does not clear exec acknowledgment.
+
+Calling `sendChannelClose` abandons a still-pending observation. An already
+framed packet must still drain normally; it cannot be removed from an
+application-owned transport queue. If close precedes framing, the opted-in
+exec is not sent. A single late reply for a framed, abandoned request is
+consumed without changing `EndedUnacknowledged`, even if other channels keep
+the transport alive. It cannot credit a reused channel slot. Foreign,
+unsolicited, duplicate, unissued, pre-handoff, truncated, and trailing-data
+replies are protocol errors, never acceptance. Correlation follows the SSH
+channel and ordered reply contract; no peer-echoed request token exists.
+Global keepalive/forwarding replies occupy a separate slot.
+
+The caller owns bounded waiting and classification. For a direct transport,
+start a reply budget only after the complete packet is actually sent. A
+buffering adapter must track its own cumulative flush watermark when
+`HandedToTransport` is first observed, as described for keepalives below.
+Neither local handoff nor a global keepalive substitutes for exec acceptance.
+This option adds no timer, retries, terminal markers, or automatic failure
+policy. The production pump tests include real encrypted acceptance across
+partial writes, optional PTY/agent setup, rekey, and concurrent keepalives.
 
 ## Explicit acknowledged client keepalives
 

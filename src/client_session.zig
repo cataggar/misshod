@@ -147,6 +147,10 @@ pub const Session = struct {
     auto_pty_width_px: u32,
     auto_pty_height_px: u32,
     auto_exec_command: ?[]u8,
+    auto_exec_ack_enabled: bool = false,
+    auto_exec_ack: Sshz.AutoExecAckStatus = .{},
+    auto_exec_reply_pending: bool = false,
+    auto_exec_write_in_flight: bool = false,
     auto_session_enabled: bool,
     auto_channel_read_credit_enabled: bool,
     kbd_interactive_response: ?[]u8, // allocated
@@ -266,7 +270,7 @@ pub const Session = struct {
         self.pending_channel_replies_head = 0;
         self.pending_channel_replies_len = 0;
         self.channel_window_adjust_in_flight = false;
-        self.endGlobalRequests();
+        self.endSessionRequests();
         self.keydata.clear();
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
@@ -295,7 +299,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.endGlobalRequests();
+        self.endSessionRequests();
         self.clearAndFreeOptional(&self.privkey_ascii);
         self.clearAndFreeOptional(&self.privkey_passphrase);
         self.clearAndFreeOptional(&self.auth_passphrase);
@@ -1044,6 +1048,10 @@ pub const Session = struct {
                 const mode: ClientChannelOpenMode = if (self.auto_exec_command != null) .AutoExec else .AutoShell;
                 const chan = try self.allocateClientSessionChannel(mode);
                 self.automatic_session_channel_id = chan.local_id;
+                if (mode == .AutoExec and self.auto_exec_ack_enabled) {
+                    if (self.auto_exec_ack.outcome != .NotRequested) return IoError.UnexpectedResponse;
+                    self.auto_exec_ack = .{ .channel = chan.local_id, .outcome = .Pending };
+                }
                 self.active_channel_id = chan.local_id;
                 self.setSessionState(.ChannelActive);
             },
@@ -1192,6 +1200,7 @@ pub const Session = struct {
                 chan.state = .RspWrite;
             },
             .RspWrite => {
+                var acknowledged_exec = false;
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 try pkt.writeU32(chan.remote_id);
@@ -1209,7 +1218,13 @@ pub const Session = struct {
                             const command = self.auto_exec_command orelse return IoError.UnexpectedResponse;
                             defer self.clearAndFreeOptional(&self.auto_exec_command);
                             try pkt.writeU32LenString("exec");
-                            try pkt.writeBoolean(false); // want reply
+                            acknowledged_exec = self.auto_exec_ack_enabled;
+                            if (acknowledged_exec and
+                                (self.auto_exec_ack.channel != chan.local_id or
+                                    self.auto_exec_ack.outcome != .Pending or
+                                    self.auto_exec_ack.transmission != .NotStarted))
+                                return IoError.UnexpectedResponse;
+                            try pkt.writeBoolean(acknowledged_exec);
                             try pkt.writeU32LenString(command);
                         },
                         .RawSession => return IoError.UnexpectedResponse,
@@ -1218,6 +1233,11 @@ pub const Session = struct {
                 }
 
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
+                if (acknowledged_exec) {
+                    self.auto_exec_ack.transmission = .Emitting;
+                    self.auto_exec_reply_pending = true;
+                    self.auto_exec_write_in_flight = true;
+                }
             },
             .RspFailureWrite => return IoError.UnexpectedResponse,
             .Connected => {
@@ -1754,6 +1774,11 @@ pub const Session = struct {
                 chan.close_pending = false;
                 chan.close_sent = true;
                 chan.eof_pending = false;
+                if (self.auto_exec_ack.channel == chan.local_id) {
+                    // Cancelling setup must not resume PTY/agent/exec after
+                    // the close packet finishes, including across rekey.
+                    chan.state = .DataRx;
+                }
             },
         }
         return true;
@@ -1925,6 +1950,7 @@ pub const Session = struct {
 
     pub fn sendChannelClose(self: *Self, channel_id: u32, sshz: *SshzClient) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        self.endAutoExecAck(channel_id);
         if (chan.close_sent or chan.close_pending) return;
         chan.close_pending = true;
         chan.eof_pending = false;
@@ -1958,7 +1984,7 @@ pub const Session = struct {
             return IoError.UnexpectedResponse;
         }
         if (!enabled and
-            (self.agent_forwarding_enabled or self.auto_exec_command != null or self.auto_pty_requested))
+            (self.agent_forwarding_enabled or self.auto_exec_command != null or self.auto_pty_requested or self.auto_exec_ack_enabled))
         {
             return IoError.UnexpectedResponse;
         }
@@ -1977,6 +2003,48 @@ pub const Session = struct {
         const replacement = try self.allocator.dupe(u8, command);
         self.clearAndFreeOptional(&self.auto_exec_command);
         self.auto_exec_command = replacement;
+    }
+
+    pub fn setAutoExecAckEnabled(self: *Self, enabled: bool) SshzError!void {
+        if (!self.auto_session_enabled or self.user_authenticated or
+            self.channel_table.activeCount() != 0 or self.automatic_session_channel_id != null)
+            return IoError.UnexpectedResponse;
+        self.auto_exec_ack_enabled = enabled;
+    }
+
+    pub fn completeAutoExecWrite(self: *Self) void {
+        // The flag belongs to the one serialized outbound packet, not the
+        // channel's Connected state or any subsequent channel/global output.
+        if (self.auto_exec_write_in_flight) {
+            self.auto_exec_write_in_flight = false;
+            self.auto_exec_ack.transmission = .HandedToTransport;
+        }
+    }
+
+    fn endAutoExecAck(self: *Self, channel_id: u32) void {
+        if (self.auto_exec_ack.channel == channel_id and self.auto_exec_ack.outcome == .Pending)
+            self.auto_exec_ack.outcome = .EndedUnacknowledged;
+    }
+
+    pub fn endSessionRequests(self: *Self) void {
+        self.endGlobalRequests();
+        if (self.auto_exec_ack.channel) |channel_id| self.endAutoExecAck(channel_id);
+        self.auto_exec_reply_pending = false;
+        self.auto_exec_write_in_flight = false;
+    }
+
+    fn handleAutoExecReply(self: *Self, rdr: *BufferReader, accepted: bool) SshzError!void {
+        const channel_id = try rdr.readU32();
+        if (rdr.off != rdr.payload.len or !self.auto_exec_reply_pending or
+            self.auto_exec_ack.channel != channel_id or
+            self.auto_exec_ack.transmission != .HandedToTransport)
+            return IoError.UnexpectedResponse;
+        self.auto_exec_reply_pending = false;
+        // A close can race a legitimate reply already in the stream. Consume
+        // that request's tombstone, without reviving the abandoned observation.
+        if (self.auto_exec_ack.outcome == .Pending)
+            self.auto_exec_ack.outcome = if (accepted) .Accepted else .Rejected;
+        self.setIoSessionState(.ReadPktHdr);
     }
 
     pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
@@ -2627,6 +2695,7 @@ pub const Session = struct {
 
                 if (self.channel_table.findByLocalId(recipient)) |chan| {
                     const local_id = chan.local_id;
+                    self.endAutoExecAck(local_id);
                     if (chan.kind == .Session and chan.channel_type == .Session) {
                         self.releaseExitResultReservation(local_id);
                     }
@@ -2695,6 +2764,9 @@ pub const Session = struct {
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
                 try self.handleChannelRequestPacket(&rdr, sshz);
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS),
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE),
+            => try self.handleAutoExecReply(&rdr, msgid == @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS)),
             @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
                 const reason_code = try rdr.readU32();
@@ -2735,6 +2807,7 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
+                self.endAutoExecAck(channelnum);
                 chan.close_received = true;
                 chan.discardWriteBuffer();
                 chan.eof_pending = false;
@@ -3054,13 +3127,484 @@ fn expectProducedPtyRequest(
 }
 
 fn expectProducedExecRequest(m: *SshzClient, expected_command: []const u8) !void {
+    try expectProducedExecRequestReply(m, expected_command, false);
+}
+
+fn expectProducedExecRequestReply(m: *SshzClient, expected_command: []const u8, want_reply: bool) !void {
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try rdr.readU8());
     _ = try rdr.readU32(); // recipient channel
     try std.testing.expectEqualStrings("exec", try rdr.readU32LenString());
-    try std.testing.expect(!(try rdr.readBoolean()));
+    try std.testing.expectEqual(want_reply, try rdr.readBoolean());
     try std.testing.expectEqualStrings(expected_command, try rdr.readU32LenString());
+}
+
+fn openAutomaticExecForTest(client: *SshzClient) !u32 {
+    client.session.user_authenticated = true;
+    client.session.setSessionState(.ChannelOpenReq);
+    client.session.setIoSessionState(.Idle);
+    try client.session.advanceSession(client);
+    const id = client.automaticSessionChannelId().?;
+    try client.advance();
+    try expectProducedChannelOpenForExecTest(client);
+    try consumeKeepaliveTestPacket(client);
+    var storage: [32]u8 = undefined;
+    var payload = BufferWriter.init(&storage, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try payload.writeU32(id);
+    try payload.writeU32(42);
+    try payload.writeU32(32768);
+    try payload.writeU32(4096);
+    try feedKeepaliveTestPayload(client, payload.active());
+    return id;
+}
+
+fn expectProducedChannelOpenForExecTest(client: *SshzClient) !void {
+    const bytes = try client.peek(Protocol.MaxSSHPacket);
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), unencryptedPayload(bytes)[0]);
+}
+
+fn feedExecReplyForTest(client: *SshzClient, id: u32, accepted: bool) !void {
+    var payload: [5]u8 = undefined;
+    payload[0] = @intFromEnum(if (accepted) Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS else Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE);
+    std.mem.writeInt(u32, payload[1..5], id, .big);
+    try feedKeepaliveTestPayload(client, &payload);
+}
+
+fn finishExecSetupForTest(client: *SshzClient) !void {
+    try consumeKeepaliveTestPacket(client);
+    try std.testing.expect((try client.getNextEvent()).Event == .Connected);
+    try client.clearEvent(.Connected);
+}
+
+test "automatic exec acknowledgment is opt-in and independent of local Connected" {
+    for ([_]bool{ false, true }) |enabled| {
+        for ([_]bool{ false, true }) |pty| {
+            for ([_]bool{ false, true }) |agent| {
+                for ([_]bool{ false, true }) |accepted| {
+                    var random = std.Random.DefaultPrng.init(72);
+                    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+                    defer client.deinit();
+                    try client.setAutoExecAckEnabled(enabled);
+                    try client.setAutoExecCommand("run-command");
+                    if (pty) try client.setAutoPty("xterm", 80, 24, 640, 480);
+                    if (agent) try client.enableAgentForwarding();
+                    try std.testing.expectEqualDeep(Sshz.AutoExecAckStatus{}, try client.autoExecAckStatus());
+                    const id = try openAutomaticExecForTest(&client);
+                    if (pty) {
+                        try expectProducedPtyRequest(&client, "xterm", 80, 24, 640, 480);
+                        try std.testing.expectEqual(.NotStarted, (try client.autoExecAckStatus()).transmission);
+                        try consumeKeepaliveTestPacket(&client);
+                    }
+                    if (agent) {
+                        try expectProducedChannelRequest(&client, Protocol.channel_request_auth_agent);
+                        var reader = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+                        _ = try reader.readU8();
+                        _ = try reader.readU32();
+                        _ = try reader.readU32LenString();
+                        try std.testing.expect(!(try reader.readBoolean()));
+                        try std.testing.expectEqual(.NotStarted, (try client.autoExecAckStatus()).transmission);
+                        try consumeKeepaliveTestPacket(&client);
+                    }
+                    try expectProducedExecRequestReply(&client, "run-command", enabled);
+                    const emitting = try client.autoExecAckStatus();
+                    if (enabled) {
+                        try std.testing.expectEqual(id, emitting.channel.?);
+                        try std.testing.expectEqual(.Pending, emitting.outcome);
+                        try std.testing.expectEqual(.Emitting, emitting.transmission);
+                    }
+                    try client.consumed(0);
+                    try client.consumed(1);
+                    try std.testing.expectEqualDeep(emitting, try client.autoExecAckStatus());
+                    try finishExecSetupForTest(&client);
+                    if (!enabled) {
+                        try std.testing.expectEqualDeep(Sshz.AutoExecAckStatus{}, try client.autoExecAckStatus());
+                        continue;
+                    }
+                    try std.testing.expectEqual(.HandedToTransport, (try client.autoExecAckStatus()).transmission);
+                    try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+                    try feedExecReplyForTest(&client, id, accepted);
+                    const result = try client.autoExecAckStatus();
+                    try std.testing.expectEqual(if (accepted) Sshz.AutoExecAckOutcome.Accepted else .Rejected, result.outcome);
+                    try client.sendChannelClose(id);
+                    try std.testing.expectEqualDeep(result, try client.autoExecAckStatus());
+                    client.deinit();
+                    try std.testing.expectEqual(if (accepted) Sshz.AutoExecAckOutcome.Accepted else .Rejected, result.outcome);
+                }
+            }
+        }
+    }
+}
+
+test "exec acknowledgment configuration is pre-session and client-only" {
+    var random = std.Random.DefaultPrng.init(73);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try client.setAutoExecAckEnabled(true);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.setAutoSessionEnabled(false));
+    try client.setAutoExecAckEnabled(false);
+    try client.setAutoSessionEnabled(false);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.setAutoExecAckEnabled(true));
+    try client.setAutoSessionEnabled(true);
+    try client.setAutoExecCommand("run-command");
+    try client.setAutoExecAckEnabled(true);
+    _ = try openAutomaticExecForTest(&client);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.setAutoExecAckEnabled(false));
+    var server = try Sshz.SshzServer.init(random.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer server.deinit();
+    try std.testing.expectError(IoError.UnimplementedService, server.setAutoExecAckEnabled(true));
+    try std.testing.expectError(IoError.UnimplementedService, server.autoExecAckStatus());
+}
+
+test "exec replies reject foreign malformed unsolicited and duplicate acknowledgments" {
+    const Case = enum { Foreign, Unknown, Global, Truncated, Trailing, Unsolicited, Duplicate };
+    for (std.enums.values(Case)) |case| {
+        var random = std.Random.DefaultPrng.init(74);
+        var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+        defer client.deinit();
+        try client.setAutoExecCommand("run-command");
+        try client.setAutoExecAckEnabled(case != .Unsolicited);
+        const id = try openAutomaticExecForTest(&client);
+        try finishExecSetupForTest(&client);
+        var recipient = id;
+        if (case == .Foreign) {
+            const other = client.session.channel_table.allocChannel(43, 32768, 4096).?;
+            other.state = .DataRx;
+            recipient = other.local_id;
+        }
+        if (case == .Unknown) recipient += 100;
+        if (case == .Duplicate) try feedExecReplyForTest(&client, id, true);
+        var payload: [6]u8 = .{0} ** 6;
+        payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS);
+        if (case == .Global) payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS);
+        std.mem.writeInt(u32, payload[1..5], recipient, .big);
+        const size: usize = if (case == .Truncated) 4 else if (case == .Trailing) 6 else 5;
+        const expected_error = if (case == .Truncated) BufferError.ReaderOutOfDataErr else IoError.UnexpectedResponse;
+        try std.testing.expectError(expected_error, feedKeepaliveTestPayload(&client, payload[0..size]));
+        try std.testing.expect(client.terminated);
+        const outcome = (try client.autoExecAckStatus()).outcome;
+        try std.testing.expectEqual(
+            switch (case) {
+                .Duplicate => Sshz.AutoExecAckOutcome.Accepted,
+                .Unsolicited => .NotRequested,
+                else => .EndedUnacknowledged,
+            },
+            outcome,
+        );
+    }
+}
+
+test "exec reply cannot match an unissued or partially handed-off request" {
+    for ([_]bool{ false, true }) |framed| {
+        var random = std.Random.DefaultPrng.init(75);
+        var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+        defer client.deinit();
+        try client.setAutoExecCommand("run-command");
+        try client.setAutoExecAckEnabled(true);
+        if (!framed) try client.setAutoPty("xterm", 80, 24, 640, 480);
+        const id = try openAutomaticExecForTest(&client);
+        try client.consumed(1);
+        var payload: [5]u8 = undefined;
+        payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS);
+        std.mem.writeInt(u32, payload[1..5], id, .big);
+        const len = buildUnencryptedPacket(&client.iobuf_rd, &payload);
+        // Exercise the packet handler at this otherwise write-blocked boundary.
+        try std.testing.expectError(IoError.UnexpectedResponse, client.session.handlePacket(client.iobuf_rd[0..len], &client));
+        try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+    }
+}
+
+test "global replies and exec replies have independent ordered slots" {
+    var random = std.Random.DefaultPrng.init(76);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try client.setAutoExecCommand("run-command");
+    try client.setAutoExecAckEnabled(true);
+    const id = try openAutomaticExecForTest(&client);
+    try finishExecSetupForTest(&client);
+    const token = try client.requestKeepalive();
+    try consumeKeepaliveTestPacket(&client);
+    try feedKeepaliveTestPayload(&client, &.{@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE)});
+    try std.testing.expect((try client.keepaliveStatus(token)).outcome == .Acknowledged);
+    try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+    try feedExecReplyForTest(&client, id, false);
+    try std.testing.expectEqual(.Rejected, (try client.autoExecAckStatus()).outcome);
+    try std.testing.expectEqual(Sshz.KeepaliveReply.Failure, (try client.keepaliveStatus(token)).outcome.Acknowledged);
+}
+
+test "partial exec output preserves queued EOF and CLOSE without an acknowledgment" {
+    for ([_]bool{ false, true }) |close| {
+        var random = std.Random.DefaultPrng.init(77);
+        var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+        defer client.deinit();
+        try client.setAutoExecCommand("run-command");
+        try client.setAutoExecAckEnabled(true);
+        const id = try openAutomaticExecForTest(&client);
+        try client.consumed(1);
+        if (close) try client.sendChannelClose(id) else try client.sendChannelEof(id);
+        try std.testing.expectEqual(.Emitting, (try client.autoExecAckStatus()).transmission);
+        try consumeKeepaliveTestPacket(&client);
+        const control = try client.peek(Protocol.MaxSSHPacket);
+        try std.testing.expectEqual(
+            @intFromEnum(if (close) Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE else Protocol.MsgId.SSH_MSG_CHANNEL_EOF),
+            unencryptedPayload(control)[0],
+        );
+        try client.consumed(control.len);
+        try std.testing.expectEqual(.HandedToTransport, (try client.autoExecAckStatus()).transmission);
+        try std.testing.expectEqual(if (close) Sshz.AutoExecAckOutcome.EndedUnacknowledged else .Pending, (try client.autoExecAckStatus()).outcome);
+        if (!close) {
+            try std.testing.expect(try client.channelEofFlushed(id));
+            try std.testing.expect((try client.getNextEvent()).Event == .Connected);
+            try client.clearEvent(.Connected);
+            try feedExecReplyForTest(&client, id, true);
+            try std.testing.expectEqual(.Accepted, (try client.autoExecAckStatus()).outcome);
+        }
+    }
+}
+
+test "closing before exec is framed drains prior setup without issuing the command" {
+    var random = std.Random.DefaultPrng.init(79);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try client.setAutoExecCommand("run-command");
+    try client.setAutoExecAckEnabled(true);
+    try client.setAutoPty("xterm", 80, 24, 640, 480);
+    const id = try openAutomaticExecForTest(&client);
+    try expectProducedPtyRequest(&client, "xterm", 80, 24, 640, 480);
+    try client.consumed(1);
+    try client.sendChannelClose(id);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), unencryptedPayload(try client.peek(Protocol.MaxSSHPacket))[0]);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect((try client.getNextEvent()) == .ReadyToConsume);
+    const status = try client.autoExecAckStatus();
+    try std.testing.expectEqual(.NotStarted, status.transmission);
+    try std.testing.expectEqual(.EndedUnacknowledged, status.outcome);
+    var close_payload: [5]u8 = undefined;
+    close_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
+    std.mem.writeInt(u32, close_payload[1..5], id, .big);
+    try feedKeepaliveTestPayload(&client, &close_payload);
+    try std.testing.expectEqual(id, (try client.getNextEvent()).Event.ChannelClosed);
+    try client.clearEvent(.{ .ChannelClosed = id });
+    try std.testing.expect((try client.getNextEvent()).Event == .EndSession);
+    try std.testing.expectEqualDeep(status, try client.autoExecAckStatus());
+}
+
+test "disconnect and deadline end pending exec observation without acknowledging it" {
+    for ([_]bool{ false, true }) |timeout| {
+        var random = std.Random.DefaultPrng.init(80);
+        var client = try SshzClient.initWithLimits(random.random(), "test", std.testing.allocator, .{
+            .deadlines = .{ .total_session = 10 },
+        });
+        defer client.deinit();
+        try client.initializeDeadlines(0);
+        try client.setAutoExecCommand("run-command");
+        try client.setAutoExecAckEnabled(true);
+        _ = try openAutomaticExecForTest(&client);
+        try finishExecSetupForTest(&client);
+        const pending = try client.autoExecAckStatus();
+        if (timeout) {
+            try std.testing.expect((try client.tick(10)) != null);
+            try std.testing.expect(client.terminated);
+        } else {
+            var backing: [64]u8 = undefined;
+            var payload = BufferWriter.init(&backing, 0);
+            try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+            try payload.writeU32(11);
+            try payload.writeU32LenString("finished");
+            try payload.writeU32LenString("");
+            try feedKeepaliveTestPayload(&client, payload.active());
+            try std.testing.expect((try client.getNextEvent()).Event == .EndSession);
+        }
+        const result = try client.autoExecAckStatus();
+        try std.testing.expectEqual(.EndedUnacknowledged, result.outcome);
+        try std.testing.expectEqual(pending.channel, result.channel);
+        try std.testing.expectEqual(pending.transmission, result.transmission);
+        try std.testing.expectEqual(.Pending, pending.outcome);
+    }
+}
+
+test "automatic channel open failure ends exec observation before transmission" {
+    var random = std.Random.DefaultPrng.init(81);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try client.setAutoExecCommand("run-command");
+    try client.setAutoExecAckEnabled(true);
+    client.session.user_authenticated = true;
+    client.session.setSessionState(.ChannelOpenReq);
+    client.session.setIoSessionState(.Idle);
+    try client.session.advanceSession(&client);
+    const id = client.automaticSessionChannelId().?;
+    try client.advance();
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expectEqual(.NotStarted, (try client.autoExecAckStatus()).transmission);
+    var backing: [64]u8 = undefined;
+    var payload = BufferWriter.init(&backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+    try payload.writeU32(id);
+    try payload.writeU32(1);
+    try payload.writeU32LenString("denied");
+    try payload.writeU32LenString("");
+    try feedKeepaliveTestPayload(&client, payload.active());
+    try std.testing.expectEqual(id, (try client.getNextEvent()).Event.ChannelOpenFailure.channel);
+    try std.testing.expectEqual(.EndedUnacknowledged, (try client.autoExecAckStatus()).outcome);
+    try std.testing.expectEqual(.NotStarted, (try client.autoExecAckStatus()).transmission);
+}
+
+test "early encrypted output and terminal results drain independently of exec acknowledgment" {
+    const Reply = enum { Accept, Reject, Missing, AfterClose };
+    const Message = enum { Data, Extended, Exit, Eof, Reply, Close, LateReply };
+    for ([_]bool{ false, true }) |encrypted| {
+        for ([_]bool{ false, true }) |signal| {
+            for (std.enums.values(Reply)) |reply| {
+                var random = std.Random.DefaultPrng.init(78);
+                var rand = random.random();
+                var client = try SshzClient.init(rand, "test", std.testing.allocator);
+                defer client.deinit();
+                try client.setAutoExecCommand("run-command");
+                try client.setAutoExecAckEnabled(true);
+                const id = try openAutomaticExecForTest(&client);
+                try finishExecSetupForTest(&client);
+                if (reply == .AfterClose) {
+                    const other = client.session.channel_table.allocChannel(43, 32768, 4096).?;
+                    other.state = .DataRx;
+                }
+                if (encrypted) {
+                    try client.session.keydata.genKeys(.{0x31} ** 32, .{0x42} ** 32, .{0x53} ** 32);
+                    client.session.encrypted = true;
+                    client.session.inbound_encrypted = true;
+                    client.iostate_rd = .Idle;
+                    client.session.setIoSessionState(.ReadPktHdr);
+                }
+                var peer_keys = client.session.keydata.s2c;
+                defer peer_keys.clear();
+                const pending_snapshot = try client.autoExecAckStatus();
+                var stream: [2048]u8 = undefined;
+                var stream_len: usize = 0;
+                for (std.enums.values(Message)) |message| {
+                    if (message == .Reply and (reply == .Missing or reply == .AfterClose)) continue;
+                    if (message == .LateReply and reply != .AfterClose) continue;
+                    var backing: [256]u8 = undefined;
+                    var payload = BufferWriter.init(&backing, 0);
+                    const msgid: Protocol.MsgId = switch (message) {
+                        .Data => .SSH_MSG_CHANNEL_DATA,
+                        .Extended => .SSH_MSG_CHANNEL_EXTENDED_DATA,
+                        .Exit => .SSH_MSG_CHANNEL_REQUEST,
+                        .Eof => .SSH_MSG_CHANNEL_EOF,
+                        .Reply => if (reply == .Accept) .SSH_MSG_CHANNEL_SUCCESS else .SSH_MSG_CHANNEL_FAILURE,
+                        .Close => .SSH_MSG_CHANNEL_CLOSE,
+                        .LateReply => .SSH_MSG_CHANNEL_SUCCESS,
+                    };
+                    try payload.writeU8(@intFromEnum(msgid));
+                    try payload.writeU32(id);
+                    switch (message) {
+                        .Data => try payload.writeU32LenString("early-output"),
+                        .Extended => {
+                            try payload.writeU32(1);
+                            try payload.writeU32LenString("early-error");
+                        },
+                        .Exit => {
+                            try payload.writeU32LenString(if (signal) "exit-signal" else "exit-status");
+                            try payload.writeBoolean(false);
+                            if (signal) {
+                                try payload.writeU32LenString("TERM");
+                                try payload.writeBoolean(false);
+                                try payload.writeU32LenString("terminated");
+                                try payload.writeU32LenString("");
+                            } else try payload.writeU32(7);
+                        },
+                        else => {},
+                    }
+                    stream_len += (try Protocol.wrapPayload(&rand, encrypted, &peer_keys, payload.active(), stream[stream_len..])).len;
+                }
+                var cursor: usize = 0;
+                var data_seen = false;
+                var extended_seen = false;
+                var eof_seen = false;
+                var closed_seen = false;
+                var ended = false;
+                for (0..1024) |_| {
+                    switch (try client.getNextEvent()) {
+                        .ReadyToConsume => |n| {
+                            if (cursor == stream_len and closed_seen and reply == .AfterClose) break;
+                            try std.testing.expect(cursor < stream_len);
+                            const count = @min(n, 3, stream_len - cursor);
+                            try std.testing.expect(count > 0);
+                            try client.write(stream[cursor..][0..count]);
+                            cursor += count;
+                        },
+                        .ReadyToProduce, .ReadyToConsumeAndProduce => try consumeKeepaliveTestPacket(&client),
+                        .Event => |event| {
+                            switch (event) {
+                                .RxData => |data| {
+                                    try std.testing.expect(!data_seen);
+                                    try std.testing.expectEqualStrings("early-output", data.data);
+                                    try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+                                    data_seen = true;
+                                },
+                                .RxExtendedData => |data| {
+                                    try std.testing.expect(!extended_seen);
+                                    try std.testing.expectEqual(@as(u32, 1), data.data_type);
+                                    try std.testing.expectEqualStrings("early-error", data.data);
+                                    try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+                                    extended_seen = true;
+                                },
+                                .ChannelEof => {
+                                    try std.testing.expect(data_seen and extended_seen and !eof_seen);
+                                    try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
+                                    try std.testing.expect(client.channelExitResult(id) != null);
+                                    eof_seen = true;
+                                },
+                                .ChannelClosed => {
+                                    try std.testing.expect(eof_seen and !closed_seen);
+                                    closed_seen = true;
+                                },
+                                .EndSession => {
+                                    ended = true;
+                                    break;
+                                },
+                                else => return error.TestUnexpectedResult,
+                            }
+                            try client.clearEvent(event);
+                        },
+                    }
+                }
+                try std.testing.expect(closed_seen);
+                try std.testing.expectEqual(reply != .AfterClose, ended);
+                try std.testing.expectEqual(stream_len, cursor);
+                try std.testing.expectEqual(peer_keys.seq, client.session.keydata.s2c.seq);
+                const terminal = client.channelExitResult(id).?;
+                if (signal) {
+                    try std.testing.expectEqualStrings("TERM", terminal.Signal.signal_name);
+                    try std.testing.expectEqualStrings("terminated", terminal.Signal.error_message);
+                } else try std.testing.expectEqual(@as(u32, 7), terminal.Status);
+                const result = try client.autoExecAckStatus();
+                const expected: Sshz.AutoExecAckOutcome = switch (reply) {
+                    .Accept => .Accepted,
+                    .Reject => .Rejected,
+                    .Missing, .AfterClose => .EndedUnacknowledged,
+                };
+                try std.testing.expectEqual(expected, result.outcome);
+                try std.testing.expectEqual(.Pending, pending_snapshot.outcome);
+                if (reply == .AfterClose) {
+                    const replacement = client.session.channel_table.allocChannel(44, 32768, 4096).?;
+                    replacement.state = .DataRx;
+                    try std.testing.expect(replacement.local_id != id);
+                    // Reused storage is a different channel, never a new exec
+                    // reply slot. Exercise it with a correctly encrypted reply.
+                    var payload: [5]u8 = undefined;
+                    payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS);
+                    std.mem.writeInt(u32, payload[1..5], replacement.local_id, .big);
+                    const packet = try Protocol.wrapPayload(&rand, encrypted, &peer_keys, &payload, &stream);
+                    try std.testing.expectError(IoError.UnexpectedResponse, feedKeepaliveTestBytes(&client, packet));
+                    try std.testing.expectEqual(.EndedUnacknowledged, (try client.autoExecAckStatus()).outcome);
+                }
+                client.deinit();
+                try std.testing.expectEqual(expected, result.outcome);
+            }
+        }
+    }
 }
 
 fn confirmAutoSessionChannel(m: *SshzClient, mode: ClientChannelOpenMode) !*Channel {
