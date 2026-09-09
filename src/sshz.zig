@@ -752,6 +752,28 @@ pub const ChannelRequestEvent = struct {
     request: ChannelRequestType,
 };
 
+pub const AutoExecAckOutcome = enum {
+    NotRequested,
+    Pending,
+    Accepted,
+    Rejected,
+    EndedUnacknowledged,
+};
+
+pub const AutoExecTransmission = enum {
+    NotStarted,
+    Emitting,
+    HandedToTransport,
+};
+
+/// Value-owned facts for the client's single automatic exec request.
+/// Acceptance is not command completion or application-level success.
+pub const AutoExecAckStatus = struct {
+    channel: ?u32 = null,
+    transmission: AutoExecTransmission = .NotStarted,
+    outcome: AutoExecAckOutcome = .NotRequested,
+};
+
 pub const WindowSize = struct {
     /// Server events are emitted only for an accepted `Session` channel.
     channel: u32,
@@ -1253,7 +1275,7 @@ pub fn SshzImpl(role: Role) type {
 
         // for session use
         pub fn requestEvent(self: *Self, code: eventCodeType(role), next_state: Protocol.IoSessionState) void {
-            if (role == .Client and code == .EndSession) self.session.endGlobalRequests();
+            if (role == .Client and code == .EndSession) self.session.endSessionRequests();
             self.iostate_wr = .{ .Active = .{
                 .action = .{ .Eventing = code },
                 .next_state = next_state,
@@ -1518,6 +1540,7 @@ pub fn SshzImpl(role: Role) type {
                         std.crypto.secureZero(u8, self.iobuf_wr[0..self.wr_nbytes]);
                         self.wr_nbytes = 0;
                         self.wr_off = 0;
+                        if (role == .Client) self.session.completeAutoExecWrite();
                         switch (iotype.next_state) {
                             .GlobalRequestWriteComplete => {
                                 if (role == .Client) {
@@ -1964,6 +1987,25 @@ pub fn SshzImpl(role: Role) type {
         pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoExecCommand(command),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Opts the automatic exec into `want_reply=true`. Configure before
+        /// authentication; shell, PTY, agent requests and Connected are unchanged.
+        pub fn setAutoExecAckEnabled(self: *Self, enabled: bool) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            return switch (role) {
+                .Client => self.session.setAutoExecAckEnabled(enabled),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Retains acceptance/rejection independently of data, exit results,
+        /// channel removal and EndSession. No borrowed storage or timer policy.
+        pub fn autoExecAckStatus(self: *const Self) SshzError!AutoExecAckStatus {
+            return switch (role) {
+                .Client => self.session.auto_exec_ack,
                 .Server => IoError.UnimplementedService,
             };
         }
