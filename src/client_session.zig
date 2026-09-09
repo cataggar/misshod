@@ -1670,11 +1670,9 @@ pub const Session = struct {
 
     /// Sends a queued `window-change` for the session channel, if one is due.
     ///
-    /// The write completes back into whatever `ioSessionState` was current
-    /// rather than into `.Idle`. A resize arrives on its own schedule, almost
-    /// always while a read is in flight, and that read's completion state is
-    /// still the one the session must return to; restoring it makes this a
-    /// packet interjected into the stream rather than a step in the sequence.
+    /// Completion preserves the live receive state, not a snapshot taken when
+    /// the resize was framed. A concurrent read may finish before this write;
+    /// restoring its old header/body state would replay or drop that packet.
     ///
     /// The request is cleared before the write so a failure cannot leave it
     /// retrying against a channel that is going away, and a resize that lands
@@ -1707,7 +1705,7 @@ pub const Session = struct {
         try pkt.writeU32(wc[3]); // height_px
         try sshz.requestWrite(
             try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr),
-            self.ioSessionState,
+            .WriteCompletePreserveState,
         );
         return true;
     }
@@ -1725,7 +1723,8 @@ pub const Session = struct {
         if (self.pending_window_change == null) return false;
         if (self.pending_channel_replies_len != 0 or
             self.sessionState != .ChannelActive or self.is_rekeying or
-            sshz.local_rekey_pending or sshz.iostate_wr != .Idle)
+            sshz.local_rekey_pending or sshz.iostate_wr != .Idle or
+            self.ioSessionState == .ReadPktCompletion)
         {
             return false;
         }
@@ -1865,10 +1864,10 @@ pub const Session = struct {
         return false;
     }
 
-    pub fn completeChannelWindowAdjust(self: *Self, sshz: *SshzClient) SshzError!void {
-        if (!self.channel_window_adjust_in_flight) return;
+    pub fn completePreservedWrite(self: *Self, sshz: *SshzClient) SshzError!void {
         self.channel_window_adjust_in_flight = false;
-        _ = try self.dispatchDeferredChannelWrite(sshz);
+        if (self.ioSessionState != .ReadPktCompletion)
+            _ = try self.dispatchDeferredChannelWrite(sshz);
     }
 
     pub fn channelReadConsumed(
@@ -7364,7 +7363,7 @@ test "a queued window-change is flushed while the channel sits idle" {
     try std.testing.expectEqual(ChannelState.DataRx, chan.state);
 }
 
-test "a flushed window-change returns the session to the state it interrupted" {
+test "a flushed window-change preserves the live session state" {
     // A resize almost always lands while a read is outstanding. Completing the
     // write into `.Idle` would drop the read's completion state on the floor;
     // the packet has to be interjected without disturbing the sequence.
@@ -7383,11 +7382,92 @@ test "a flushed window-change returns the session to the state it interrupted" {
 
     switch (m.iostate_wr) {
         .Active => |iotype| try std.testing.expectEqual(
-            Protocol.IoSessionState.ReadPktHdr,
+            Protocol.IoSessionState.WriteCompletePreserveState,
             std.meta.activeTag(iotype.next_state),
         ),
         else => return error.TestUnexpectedResult,
     }
+    try consumeKeepaliveTestPacket(&m);
+    try std.testing.expectEqual(Protocol.sizeof_PktHdr, (try m.getNextEvent()).ReadyToConsume);
+}
+
+test "window-change completion delivers a concurrently completed body exactly once" {
+    var random = std.Random.DefaultPrng.init(82);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
+    channel.state = .DataRx;
+    _ = try client.getNextEvent();
+    var storage: [64]u8 = undefined;
+    var payload = BufferWriter.init(&storage, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(channel.local_id);
+    try payload.writeU32LenString("one packet");
+    var packet: [96]u8 = undefined;
+    const len = buildUnencryptedPacket(&packet, payload.active());
+    try client.write(packet[0..Protocol.sizeof_PktHdr]);
+    try client.write(packet[Protocol.sizeof_PktHdr..][0..1]);
+    client.session.sendWindowChange(100, 30, 800, 480);
+    try client.advance();
+    try client.consumed(1);
+    try client.write(packet[Protocol.sizeof_PktHdr + 1 .. len]);
+    try std.testing.expect(client.session.ioSessionState == .ReadPktCompletion);
+    try consumeKeepaliveTestPacket(&client);
+    try expectAndClearClientData(&client, channel.local_id, "one packet");
+    try std.testing.expectEqual(@as(u32, 1), client.session.keydata.s2c.seq);
+    try writeClientChannelPacket(&client, channel.local_id, "next packet");
+    try expectAndClearClientData(&client, channel.local_id, "next packet");
+    try std.testing.expectEqual(@as(u32, 2), client.session.keydata.s2c.seq);
+}
+
+test "window-change completion flushes queued EOF and CLOSE without inbound traffic" {
+    for ([_]bool{ false, true }) |close| {
+        var random = std.Random.DefaultPrng.init(83);
+        var client = try keepaliveTestClient(random.random());
+        defer client.deinit();
+        const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
+        channel.state = .DataRx;
+        const id = channel.local_id;
+        _ = try client.getNextEvent();
+        client.session.sendWindowChange(100, 30, 800, 480);
+        try client.advance();
+        try client.consumed(1);
+        if (close) try client.sendChannelClose(id) else try client.sendChannelEof(id);
+        try consumeKeepaliveTestPacket(&client);
+        const control = try client.peek(Protocol.MaxSSHPacket);
+        try std.testing.expectEqual(
+            @intFromEnum(if (close) Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE else Protocol.MsgId.SSH_MSG_CHANNEL_EOF),
+            unencryptedPayload(control)[0],
+        );
+        try client.consumed(control.len);
+        if (!close) try std.testing.expect(try client.channelEofFlushed(id));
+        try std.testing.expectEqual(Protocol.sizeof_PktHdr, (try client.getNextEvent()).ReadyToConsume);
+    }
+}
+
+test "resize completion handles a received close before queued resize and EOF" {
+    var random = std.Random.DefaultPrng.init(84);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
+    channel.state = .DataRx;
+    const id = channel.local_id;
+    _ = try client.getNextEvent();
+    client.session.sendWindowChange(100, 30, 800, 480);
+    try client.advance();
+    try client.consumed(1);
+    try client.sendChannelEof(id);
+    client.session.sendWindowChange(120, 40, 960, 640);
+    var payload: [5]u8 = undefined;
+    payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
+    std.mem.writeInt(u32, payload[1..5], id, .big);
+    try feedKeepaliveTestPayload(&client, &payload);
+    try std.testing.expect(client.session.ioSessionState == .ReadPktCompletion);
+    try consumeKeepaliveTestPacket(&client);
+    const close = try client.peek(Protocol.MaxSSHPacket);
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), unencryptedPayload(close)[0]);
+    try client.consumed(close.len);
+    try std.testing.expectEqual(id, (try client.getNextEvent()).Event.ChannelClosed);
 }
 
 test "a window-change waits for the write side to be free" {

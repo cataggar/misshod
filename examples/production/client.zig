@@ -308,8 +308,8 @@ test "production client pump is compile-checked without network I/O" {
 }
 
 const ProductionTestTransport = struct {
-    // Model stream-accepted bytes waiting for the peer to read, not an
-    // adapter's unsent output queue.
+    // Normally model stream-accepted bytes waiting for the peer to read.
+    // Buffered schedules instead treat this owned queue as unsent output.
     to_server: [16384]u8 = undefined,
     to_server_len: usize = 0,
     to_client: [3 * sshz.ResourceCapacities.packet_size]u8 = undefined,
@@ -352,9 +352,31 @@ const ProductionTestTransport = struct {
     fn close(_: *anyopaque) void {}
 };
 
-fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, rekey: bool) !void {
+const ProbeSchedule = struct {
+    trigger: enum { ServerRequest, ExecEmitting, Connected, Header, Body } = .ServerRequest,
+    prefer_read: bool = false,
+    buffered: bool = false,
+    stream_data: bool = false,
+    resize_before_probe: enum { None, Queued, Advanced } = .None,
+};
+
+fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, rekey: bool, schedule: ProbeSchedule) !void {
     const Loopback = ProductionTestTransport;
+    const Delivery = struct {
+        expected: []const u8,
+        received: usize = 0,
+
+        fn data(context: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(bytes.len <= self.expected.len - self.received);
+            try std.testing.expectEqualSlices(u8, self.expected[self.received..][0..bytes.len], bytes);
+            self.received += bytes.len;
+        }
+    };
     var random = std.Random.DefaultPrng.init(2);
+    var channel_data: [32768]u8 = undefined;
+    if (schedule.stream_data) random.random().bytes(&channel_data);
+    var delivery: Delivery = .{ .expected = if (schedule.stream_data) &channel_data else &.{} };
     var server = try sshz.SshzServer.initWithLimits(
         random.random(),
         @embedFile("production_test_host_key"),
@@ -374,7 +396,7 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
         },
         .host_keys = .{ .context = &loopback, .verify_fn = Loopback.verify },
         .credentials = .{ .context = &loopback },
-        .sink = .{ .context = &loopback, .data_fn = Loopback.data, .extended_data_fn = Loopback.extendedData },
+        .sink = .{ .context = &delivery, .data_fn = Delivery.data, .extended_data_fn = Loopback.extendedData },
     };
     const transport: common.Transport = .{
         .context = &loopback,
@@ -400,14 +422,31 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
     var reads_before_probe: usize = 0;
     var exec_partial = false;
     var exec_pending_through_rekey = false;
+    var reply_start: usize = 0;
+    var server_read: usize = 0;
+    var probe_watermark: ?usize = null;
+    var saw_duplex_read = false;
+    var server_channel: ?u32 = null;
+    var data_queued = false;
     for (0..2000) |step| {
         switch (try server.getNextEvent()) {
             .ReadyToConsume => |n| {
                 const count = @min(n, loopback.to_server_len);
-                if (count != 0) {
+                const hold_flush = schedule.buffered and token != null and
+                    (try client.keepaliveStatus(token.?)).transmission == .Emitting;
+                const keys = server.keyLifetimeStatus();
+                if (schedule.stream_data and !data_queued and server_channel != null and
+                    server.isActive() and !keys.rekey_in_progress and !keys.local_rekey_pending)
+                {
+                    const buffer = try server.getChannelWriteBuffer(server_channel.?);
+                    @memcpy(buffer[0..channel_data.len], &channel_data);
+                    try server.channelWriteComplete(server_channel.?, channel_data.len);
+                    data_queued = true;
+                } else if (count != 0 and !hold_flush) {
                     try server.write(loopback.to_server[0..count]);
                     std.mem.copyForwards(u8, &loopback.to_server, loopback.to_server[count..loopback.to_server_len]);
                     loopback.to_server_len -= count;
+                    server_read += count;
                 }
             },
             .ReadyToProduce, .ReadyToConsumeAndProduce => {
@@ -421,9 +460,12 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
                 .UserAuth => try server.decideUserAuth(.Allow),
                 .ChannelOpenRequest => |request| try server.acceptChannelOpen(request.channel),
                 .Connected => try server.clearEvent(event),
+                .WindowChange => try server.clearEvent(event),
                 .ChannelRequest => |request| {
                     if (request.request == .Exec) {
                         command_requested = true;
+                        server_channel = request.channel;
+                        reply_start = loopback.bytes_read;
                         if (exec_ack) {
                             try std.testing.expectEqual(.Pending, (try client.autoExecAckStatus()).outcome);
                             try std.testing.expectEqual(.HandedToTransport, (try client.autoExecAckStatus()).transmission);
@@ -435,9 +477,52 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
                 else => return error.UnexpectedServerEvent,
             },
         }
+        const before_event = client.getNextEvent() catch |err| switch (err) {
+            error.NotReady => null,
+            else => return err,
+        };
+        const before = try client.autoExecAckStatus();
+        const trigger = switch (schedule.trigger) {
+            .ServerRequest => command_requested and client.isActive() and client.automaticSessionChannelId() != null,
+            .ExecEmitting => before.transmission == .Emitting,
+            .Connected => if (before_event) |event| event == .Event and event.Event == .Connected else false,
+            .Header => command_requested and loopback.bytes_read > reply_start and loopback.bytes_read < reply_start + 16,
+            .Body => command_requested and loopback.bytes_read > reply_start + 16 and before.outcome == .Pending,
+        };
+        if (token == null and trigger) {
+            if (exec_ack) try std.testing.expectEqual(.Pending, before.outcome);
+            const keys = client.keyLifetimeStatus();
+            var retained: [sshz.ResourceCapacities.packet_size]u8 = undefined;
+            const outgoing = if (before_event) |event| switch (event) {
+                .ReadyToProduce, .ReadyToConsumeAndProduce => try client.peek(retained.len),
+                else => &.{},
+            } else &.{};
+            const retained_len = outgoing.len;
+            @memcpy(retained[0..retained_len], outgoing);
+            if (schedule.resize_before_probe != .None) {
+                client.session.sendWindowChange(100, 30, 800, 480);
+                if (schedule.resize_before_probe == .Advanced) try client.advance();
+            }
+            token = try client.requestKeepalive();
+            try std.testing.expectEqualDeep(keys.inbound, client.keyLifetimeStatus().inbound);
+            if (retained_len != 0) {
+                try std.testing.expectEqualSlices(u8, retained[0..retained_len], try client.peek(retained.len));
+                try std.testing.expectEqualDeep(keys.outbound, client.keyLifetimeStatus().outbound);
+            }
+            reads_before_probe = loopback.bytes_read;
+        }
+        const current = client.getNextEvent() catch |err| switch (err) {
+            error.NotReady => null,
+            else => return err,
+        };
+        if (schedule.stream_data and command_requested and loopback.bytes_read >= reply_start + 32)
+            loopback.read_limit = scratch.len;
+        const read_first = schedule.prefer_read and loopback.to_client_len != 0 and
+            current != null and current.? == .ReadyToConsumeAndProduce;
+        if (read_first and token != null) saw_duplex_read = true;
         _ = try pumpOnce(&client, &config, transport, &scratch, .{
             .readable = loopback.to_client_len != 0 and (shutdown == null or token == null),
-            .writable = loopback.to_server_len < loopback.to_server.len,
+            .writable = loopback.to_server_len < loopback.to_server.len and !read_first,
         }, step);
         const exec_status = try client.autoExecAckStatus();
         if (exec_status.transmission == .Emitting) {
@@ -462,10 +547,13 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
                 }
             }
             if (status.transmission == .HandedToTransport and !status.transport_flushed) {
+                if (probe_watermark == null) probe_watermark = loopback.bytes_written;
                 // This adapter writes directly to the peer, without an unsent
                 // queue. Buffered adapters must wait for their own watermark.
-                try client.markKeepaliveFlushed(id);
-                status = try client.keepaliveStatus(id);
+                if (!schedule.buffered or server_read >= probe_watermark.?) {
+                    try client.markKeepaliveFlushed(id);
+                    status = try client.keepaliveStatus(id);
+                }
             }
             if (shutdown) |control| {
                 if (status.transmission == .HandedToTransport) {
@@ -492,6 +580,8 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
             }
             if (status.outcome == .Acknowledged) {
                 if (exec_ack and exec_status.outcome == .Pending) continue;
+                if (!status.transport_flushed) continue;
+                if (delivery.received != delivery.expected.len) continue;
                 try std.testing.expect(saw_partial);
                 try std.testing.expect(status.transport_flushed);
                 try std.testing.expectEqual(sshz.KeepaliveReply.Failure, status.outcome.Acknowledged);
@@ -504,24 +594,60 @@ fn exerciseProductionKeepalive(shutdown: ?enum { Eof, Close }, exec_ack: bool, r
                         try std.testing.expect(client.keyLifetimeStatus().inbound.epoch >= 2);
                     }
                 } else try std.testing.expectEqual(.NotRequested, exec_status.outcome);
+                if (schedule.prefer_read and schedule.trigger == .Header and !rekey)
+                    try std.testing.expect(saw_duplex_read);
                 try client.clearKeepalive(id);
                 return;
             }
-        } else if (command_requested and client.isActive() and client.automaticSessionChannelId() != null) {
-            token = try client.requestKeepalive();
-            reads_before_probe = loopback.bytes_read;
         }
     }
     return error.KeepaliveNotAcknowledged;
 }
 
 test "production pump explicitly observes keepalive after partial direct transport writes" {
-    try exerciseProductionKeepalive(null, false, false);
+    try exerciseProductionKeepalive(null, false, false, .{});
 }
 
 test "production encrypted exec acknowledgment survives rekey and concurrent keepalive" {
-    try exerciseProductionKeepalive(null, true, false);
-    try exerciseProductionKeepalive(null, true, true);
+    try exerciseProductionKeepalive(null, true, false, .{});
+    try exerciseProductionKeepalive(null, true, true, .{});
+}
+
+test "pre-acknowledgment probes preserve encrypted duplex packet boundaries" {
+    for (std.enums.values(@FieldType(ProbeSchedule, "trigger"))) |trigger| {
+        for ([_]bool{ false, true }) |read_first| {
+            for ([_]bool{ false, true }) |buffered| {
+                for ([_]bool{ false, true }) |rekey| {
+                    try exerciseProductionKeepalive(null, true, rekey, .{
+                        .trigger = trigger,
+                        .prefer_read = read_first,
+                        .buffered = buffered,
+                        .stream_data = true,
+                    });
+                }
+            }
+        }
+    }
+}
+
+test "queued resize and pre-acknowledgment probe preserve a received packet" {
+    for ([_]@FieldType(ProbeSchedule, "trigger"){ .Header, .Body }) |trigger| {
+        for ([_]@FieldType(ProbeSchedule, "resize_before_probe"){ .Queued, .Advanced }) |resize| {
+            for ([_]bool{ false, true }) |buffered| {
+                for ([_]bool{ false, true }) |stream_data| {
+                    for ([_]bool{ false, true }) |rekey| {
+                        try exerciseProductionKeepalive(null, true, rekey, .{
+                            .trigger = trigger,
+                            .prefer_read = true,
+                            .buffered = buffered,
+                            .stream_data = stream_data,
+                            .resize_before_probe = resize,
+                        });
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "production pump bounds large encrypted coalesced packets to the current read" {
@@ -671,8 +797,8 @@ test "production pump bounds large encrypted coalesced packets to the current re
 }
 
 test "production pump flushes EOF and CLOSE behind a cancelled keepalive without peer input" {
-    try exerciseProductionKeepalive(.Eof, false, false);
-    try exerciseProductionKeepalive(.Close, false, false);
+    try exerciseProductionKeepalive(.Eof, false, false, .{});
+    try exerciseProductionKeepalive(.Close, false, false, .{});
 }
 
 test "production pump discards unframed data across partial writes zero window and real rekey" {

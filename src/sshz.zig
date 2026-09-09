@@ -1552,7 +1552,7 @@ pub fn SshzImpl(role: Role) type {
                             },
                             .WriteCompletePreserveState => {
                                 if (role == .Client) {
-                                    self.session.completeChannelWindowAdjust(self) catch |err| {
+                                    self.session.completePreservedWrite(self) catch |err| {
                                         self.failClosed();
                                         return err;
                                     };
