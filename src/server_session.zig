@@ -3744,9 +3744,12 @@ test "server channel requests while closing or pending open do not tear down" {
     try pty_payload.writeU32(0);
     try pty_payload.writeU32(0);
     try pty_payload.writeU32LenString("");
+    const pending_state_before = pending.state;
     try deliverServerChannelRequestForTest(&m, pending.local_id, "pty-req", false, pty_payload.active());
+    try std.testing.expectEqual(pending_state_before, pending.state);
     try std.testing.expect(m.session.channel_table.findByLocalId(pending.local_id) != null);
     try std.testing.expect(!m.terminated);
+    try std.testing.expectError(IoError.notProducing, m.peek(Protocol.MaxSSHPacket));
 }
 
 test "handlePacket: unknown channel type writes open failure" {

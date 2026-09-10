@@ -7437,6 +7437,29 @@ test "client ignores late channel request after close without reply" {
     }
 }
 
+test "client ignores channel request on unestablished open" {
+    var prng = std.Random.DefaultPrng.init(71);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(60, 32768, 32768).?;
+    chan.state = .OpenSent;
+    const state_before = chan.state;
+    try m.session.reserveExitResult(chan.local_id);
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+
+    var status_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &status_payload, 7, .big);
+    try deliverChannelRequestForTest(&m, chan.local_id, Protocol.channel_request_exit_status, true, &status_payload);
+
+    try std.testing.expectEqual(state_before, chan.state);
+    try std.testing.expect(m.channelExitResult(chan.local_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), m.session.pending_channel_replies_len);
+    try std.testing.expect(!m.terminated);
+    try std.testing.expectError(IoError.notProducing, m.peek(Protocol.MaxSSHPacket));
+}
+
 test "handlePacket: auto-shell confirmation still emits Connected" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
