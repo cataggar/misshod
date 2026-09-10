@@ -11,4 +11,5 @@ comptime {
     _ = @import("channel.zig");
     _ = @import("key.zig");
     _ = @import("known_hosts.zig");
+    _ = @import("receive_completion_test.zig");
 }
