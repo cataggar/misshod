@@ -115,6 +115,7 @@ pub const Channel = struct {
     automatic_read_credit: bool,
     delivered_uncredited: u32,
     pending_window_adjust: u32,
+    // Mutate only through ChannelTable's resize queue helpers.
     pending_window_change: ?[4]u32 = null,
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
@@ -182,15 +183,7 @@ pub const Channel = struct {
     }
 
     pub fn secureZero(self: *Self) void {
-        self.discardPendingWindowChange();
         std.crypto.secureZero(u8, &self.write_buf);
-    }
-
-    pub fn discardPendingWindowChange(self: *Self) void {
-        if (self.pending_window_change != null) {
-            TRACE(.Debug, "discarding queued window-change for obsolete channel {d}", .{self.local_id});
-            self.pending_window_change = null;
-        }
     }
 
     pub fn consumeWriteBuffer(self: *Self, sent: usize) void {
@@ -364,6 +357,7 @@ pub const ChannelTable = struct {
     next_local_id: u32 = 0,
     last_serviced_slot: usize = 0,
     last_window_change_slot: usize = 0,
+    pending_window_change_count: u8 = 0,
     limits: ChannelLimits = .{},
 
     pub fn allocChannel(self: *Self, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
@@ -430,6 +424,7 @@ pub const ChannelTable = struct {
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {
                 if (ch.local_id == local_id) {
+                    self.discardPendingWindowChange(ch);
                     ch.secureZero();
                     slot.* = null;
                     return;
@@ -449,10 +444,12 @@ pub const ChannelTable = struct {
     pub fn secureZeroAll(self: *Self) void {
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {
+                self.discardPendingWindowChange(ch);
                 ch.secureZero();
                 slot.* = null;
             }
         }
+        std.debug.assert(self.pending_window_change_count == 0);
     }
 
     fn isRunnable(state: ChannelState) bool {
@@ -530,15 +527,55 @@ pub const ChannelTable = struct {
         return null;
     }
 
-    /// Resize fairness is independent of the data/control scheduler's cursor.
+    pub fn hasPendingWindowChanges(self: *const Self) bool {
+        return self.pending_window_change_count != 0;
+    }
+
+    /// All resize mutations use these helpers so the count includes each
+    /// table-owned channel exactly once, regardless of coalescing or readiness.
+    pub fn queueWindowChange(self: *Self, channel: *Channel, size: [4]u32) void {
+        if (channel.pending_window_change == null) {
+            std.debug.assert(self.pending_window_change_count < self.limits.max_channels);
+            self.pending_window_change_count += 1;
+        }
+        channel.pending_window_change = size;
+    }
+
+    pub fn takePendingWindowChange(self: *Self, channel: *Channel) ?[4]u32 {
+        const size = channel.pending_window_change orelse return null;
+        std.debug.assert(self.pending_window_change_count != 0);
+        self.pending_window_change_count -= 1;
+        channel.pending_window_change = null;
+        return size;
+    }
+
+    pub fn discardPendingWindowChange(self: *Self, channel: *Channel) void {
+        if (self.takePendingWindowChange(channel) != null) {
+            TRACE(.Debug, "discarding queued window-change for obsolete channel {d}", .{channel.local_id});
+        }
+    }
+
+    pub fn discardAllPendingWindowChanges(self: *Self) void {
+        if (!self.hasPendingWindowChanges()) return;
+        for (&self.channels) |*slot| {
+            if (slot.*) |*channel| self.discardPendingWindowChange(channel);
+        }
+        std.debug.assert(self.pending_window_change_count == 0);
+    }
+
+    /// Empty queues never inspect channel slots. When work exists, resize
+    /// fairness is independent of the data/control scheduler's cursor.
     /// A channel waiting for setup or a write cannot block another's resize.
     pub fn findNextWindowChange(self: *Self) ?*Channel {
-        for (0..MaxChannels) |i| {
-            const slot_idx = (self.last_window_change_slot + 1 + i) % MaxChannels;
+        if (!self.hasPendingWindowChanges()) return null;
+        const capacity: usize = self.limits.max_channels;
+        for (0..capacity) |i| {
+            const slot_idx = (self.last_window_change_slot + 1 + i) % capacity;
             if (self.channels[slot_idx]) |*ch| {
                 if (ch.pending_window_change == null) continue;
                 if (!ch.canRetainWindowChange()) {
-                    ch.discardPendingWindowChange();
+                    self.discardPendingWindowChange(ch);
+                    if (!self.hasPendingWindowChanges()) return null;
                     continue;
                 }
                 if (ch.canSendChannelRequest() and ch.tx_in_flight_len == 0) {
@@ -552,6 +589,121 @@ pub const ChannelTable = struct {
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "empty resize summary never reads channel slots" {
+    comptime {
+        // Undefined storage makes any accidental slot probe a compile error.
+        var table = ChannelTable{ .channels = undefined, .limits = .{ .max_channels = 1 } };
+        std.debug.assert(!table.hasPendingWindowChanges());
+        std.debug.assert(table.findNextWindowChange() == null);
+        table.discardAllPendingWindowChanges();
+    }
+}
+
+fn expectResizeSummaryForTest(table: *const ChannelTable, expected: u8) !void {
+    var actual: usize = 0;
+    for (table.channels) |slot| {
+        if (slot) |channel| {
+            if (channel.pending_window_change != null) actual += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, expected), actual);
+    try std.testing.expectEqual(expected, table.pending_window_change_count);
+    try std.testing.expectEqual(expected != 0, table.hasPendingWindowChanges());
+}
+
+test "resize summary tracks coalescing framing discard release and reset" {
+    var table = ChannelTable{ .limits = .{ .max_channels = 2 } };
+    try expectResizeSummaryForTest(&table, 0);
+    const first = table.allocChannel(100, 32768, 32768).?;
+    first.state = .DataRx;
+    const second = table.allocChannel(200, 32768, 32768).?;
+    second.state = .DataRx;
+    table.queueWindowChange(first, .{ 80, 24, 0, 0 });
+    try expectResizeSummaryForTest(&table, 1);
+    table.queueWindowChange(first, .{ 120, 40, 960, 640 });
+    try expectResizeSummaryForTest(&table, 1);
+    table.queueWindowChange(second, .{ 90, 25, 720, 400 });
+    try expectResizeSummaryForTest(&table, 2);
+    try std.testing.expect(table.findNextWindowChange().? == second);
+    try expectResizeSummaryForTest(&table, 2);
+    try std.testing.expectEqualDeep(@as(?[4]u32, .{ 90, 25, 720, 400 }), table.takePendingWindowChange(second));
+    try expectResizeSummaryForTest(&table, 1);
+    try std.testing.expect(table.takePendingWindowChange(second) == null);
+    try expectResizeSummaryForTest(&table, 1);
+    const first_id = first.local_id;
+    table.freeChannel(second.local_id);
+    try expectResizeSummaryForTest(&table, 1);
+    table.freeChannel(first_id);
+    table.freeChannel(first_id);
+    try expectResizeSummaryForTest(&table, 0);
+
+    const replacement = table.allocChannel(300, 32768, 32768).?;
+    replacement.state = .DataRx;
+    try std.testing.expect(replacement.local_id != first_id);
+    try std.testing.expect(replacement.pending_window_change == null);
+    for ([_]ChannelState{ .Closed, .OpenFailureWrite, .OpenPending }) |obsolete| {
+        replacement.state = .DataRx;
+        table.queueWindowChange(replacement, .{ 120, 40, 960, 640 });
+        try expectResizeSummaryForTest(&table, 1);
+        replacement.state = obsolete;
+        try std.testing.expect(table.findNextWindowChange() == null);
+        try expectResizeSummaryForTest(&table, 0);
+    }
+    replacement.state = .DataRx;
+    table.queueWindowChange(replacement, .{ 80, 24, 0, 0 });
+    table.discardPendingWindowChange(replacement);
+    table.discardPendingWindowChange(replacement);
+    try expectResizeSummaryForTest(&table, 0);
+    const other = table.allocChannel(400, 32768, 32768).?;
+    other.state = .DataRx;
+    table.queueWindowChange(replacement, .{ 80, 24, 0, 0 });
+    table.queueWindowChange(other, .{ 90, 25, 720, 400 });
+    table.discardAllPendingWindowChanges();
+    table.discardAllPendingWindowChanges();
+    try expectResizeSummaryForTest(&table, 0);
+    table.queueWindowChange(replacement, .{ 80, 24, 0, 0 });
+    table.queueWindowChange(other, .{ 90, 25, 720, 400 });
+    table.secureZeroAll();
+    try expectResizeSummaryForTest(&table, 0);
+    try std.testing.expectEqual(@as(u32, 0), table.activeCount());
+    const after_reset = table.allocChannel(500, 32768, 32768).?;
+    table.queueWindowChange(after_reset, .{ 80, 24, 0, 0 });
+    try expectResizeSummaryForTest(&table, 1);
+    _ = table.takePendingWindowChange(after_reset);
+    try expectResizeSummaryForTest(&table, 0);
+}
+
+test "resize summary spans compiled capacity and honors a lower runtime limit" {
+    const table = try std.testing.allocator.create(ChannelTable);
+    defer std.testing.allocator.destroy(table);
+    table.* = .{};
+    for (0..MaxChannels) |index| {
+        const channel = table.allocChannel(@intCast(index), 32768, 32768).?;
+        channel.state = .DataRx;
+        table.queueWindowChange(channel, .{ 80, 24, 0, 0 });
+        table.queueWindowChange(channel, .{ 120, 40, 960, 640 });
+        try expectResizeSummaryForTest(table, @intCast(index + 1));
+    }
+    for (0..MaxChannels) |index| {
+        const channel = table.findNextWindowChange().?;
+        try std.testing.expectEqual(@as(u32, @intCast((index + 1) % MaxChannels)), channel.local_id);
+        _ = table.takePendingWindowChange(channel);
+        try expectResizeSummaryForTest(table, @intCast(MaxChannels - index - 1));
+    }
+    try std.testing.expect(table.findNextWindowChange() == null);
+    table.secureZeroAll();
+    table.limits.max_channels = 1;
+    const only = table.allocChannel(1000, 32768, 32768).?;
+    only.state = .DataRx;
+    table.last_window_change_slot = MaxChannels - 1;
+    table.queueWindowChange(only, .{ 80, 24, 0, 0 });
+    try std.testing.expect(table.findNextWindowChange().? == only);
+    try expectResizeSummaryForTest(table, 1);
+    table.discardPendingWindowChange(only);
+    try expectResizeSummaryForTest(table, 0);
+    try std.testing.expect(table.findNextWindowChange() == null);
+}
 
 test "outbound channel requests wait for setup without restricting confirmed receive" {
     var channel = Channel.init(0, 42, 32768, 32768);
@@ -590,11 +742,11 @@ test "pending resize storage follows channel capacity and resets on slot release
     for (0..2) |index| {
         const channel = table.allocChannel(@intCast(100 + index), 32768, 32768).?;
         channel.state = .DataRx;
-        channel.pending_window_change = .{ 80, 24, 0, 0 };
+        table.queueWindowChange(channel, .{ 80, 24, 0, 0 });
     }
     try std.testing.expect(table.allocChannel(300, 32768, 32768) == null);
     const channel = table.findByLocalId(0).?;
-    channel.pending_window_change = .{ 120, 40, 960, 640 };
+    table.queueWindowChange(channel, .{ 120, 40, 960, 640 });
     try std.testing.expectEqualDeep(@as(?[4]u32, .{ 80, 24, 0, 0 }), table.findByLocalId(1).?.pending_window_change);
     table.freeChannel(0);
     const replacement = table.allocChannel(300, 32768, 32768).?;

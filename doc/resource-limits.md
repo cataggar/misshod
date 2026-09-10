@@ -74,7 +74,14 @@ buffer; it is not replaced by a later update.
 
 Ready resize targets are scanned round-robin with a separate bounded cursor,
 so setup or in-flight data on one channel does not starve another channel's
-size. Close/rejection/removal clears obsolete sizes with metadata-only debug
+size. One additional `u8` table counter tracks channels with queued sizes,
+including setup-blocked channels but excluding the early automatic slot and
+already-framed requests. Coalescing does not increment it. Enqueue, framing,
+discard, removal, and reset update it through table-owned queue helpers.
+With no queued channel size, the resize pump returns in O(1) without probing
+any channel slot, regardless of compiled capacity. Nonempty resize scans are
+bounded by the runtime `max_channels` limit.
+Close/rejection/removal clears obsolete sizes with metadata-only debug
 tracing, and slot reuse never inherits them. See
 [terminal resize requests](api-production.md#terminal-resize-requests)
 for explicit-target validation, automatic preallocation behavior, and the
