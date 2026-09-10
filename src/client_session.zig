@@ -8201,7 +8201,7 @@ test "explicit resize rejects invalid targets without changing any pending size"
     try client.sendChannelWindowChange(valid.local_id, 120, 40, 960, 640);
     const expected: ?[4]u32 = .{ 120, 40, 960, 640 };
     try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(9999, 1, 2, 3, 4));
-    for ([_]ChannelState{ .OpenWrite, .OpenSent, .Open, .ConfirmWrite, .RspWrite, .RspFailureWrite, .CloseWrite, .Closed, .OpenFailureWrite }) |state| {
+    for ([_]ChannelState{ .OpenWrite, .OpenSent, .Open, .OpenPending, .ConfirmWrite, .RspWrite, .RspFailureWrite, .CloseWrite, .Closed, .OpenFailureWrite }) |state| {
         candidate.state = state;
         candidate.pending_window_change = .{ 80, 24, 0, 0 };
         try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(candidate.local_id, 1, 2, 3, 4));

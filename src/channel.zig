@@ -269,7 +269,7 @@ pub const Channel = struct {
         if (!self.remote_id_known or self.close_pending or self.close_sent or self.close_received) return false;
         return switch (self.state) {
             .Connected, .Data, .DataRx, .DataTx, .DataTxComplete => true,
-            .OpenWrite, .Open, .OpenSent, .ConfirmWrite, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite, .Closed, .OpenFailureWrite => false,
+            .OpenWrite, .Open, .OpenPending, .OpenSent, .ConfirmWrite, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite, .Closed, .OpenFailureWrite => false,
         };
     }
 
@@ -567,6 +567,8 @@ test "outbound channel requests wait for setup without restricting confirmed rec
         try std.testing.expect(!channel.canSendChannelRequest());
         channel.remote_id_known = true;
     }
+    channel.state = .OpenPending;
+    try std.testing.expect(!channel.canRetainWindowChange());
     channel.state = .Open;
     try std.testing.expect(channel.canReceiveRequestPacket());
     try std.testing.expect(!channel.canSendChannelRequest());
