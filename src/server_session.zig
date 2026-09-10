@@ -769,7 +769,7 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                 }
             },
-            .OpenSent => {
+            .OpenPending, .OpenSent => {
                 self.setIoSessionState(.ReadPktHdr);
             },
         }
@@ -777,7 +777,7 @@ pub const Session = struct {
 
     pub fn acceptChannelOpen(self: *Self, channel_id: u32) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
-        if (chan.state != .Open) return IoError.UnexpectedResponse;
+        if (chan.state != .OpenPending) return IoError.UnexpectedResponse;
         chan.state = .ConfirmWrite;
         self.active_channel_id = channel_id;
         self.resumeChannelActive();
@@ -786,7 +786,7 @@ pub const Session = struct {
 
     pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) SshzError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
-        if (chan.state != .Open) return IoError.UnexpectedResponse;
+        if (chan.state != .OpenPending) return IoError.UnexpectedResponse;
         chan.open_failure_reason_code = reason_code;
         chan.open_failure_description = description;
         chan.state = .OpenFailureWrite;
@@ -1433,7 +1433,7 @@ pub const Session = struct {
         chan.tcpip_open = tcpip_open;
         chan.automatic_read_credit = self.auto_channel_read_credit_enabled;
 
-        chan.state = .Open;
+        chan.state = .OpenPending;
         self.active_channel_id = null;
         self.resumeChannelActive();
         self.requestChannelOpenEvent(sshz, chan);
@@ -3408,13 +3408,14 @@ fn rejectServerDirectOpenDuringRekeyForTest(m: *SshzServer) !u32 {
     m.session.user_authenticated = true;
     m.session.setSessionState(.Authenticated);
     const channel_id = try requestServerDirectTcpipOpenForTest(m, 88);
+    const chan = m.session.channel_table.findByLocalId(channel_id).?;
+    try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
 
     m.session.session_id_established = true;
     m.session.is_rekeying = true;
     m.session.rekey_resume_state = .ChannelActive;
     m.session.setSessionState(.KexInitRead);
     try m.rejectChannelOpen(channel_id, SshOpenFailureReason.AdministrativelyProhibited, "denied");
-    const chan = m.session.channel_table.findByLocalId(channel_id).?;
     try std.testing.expectEqual(ChannelState.OpenFailureWrite, chan.state);
     try std.testing.expect(m.session.is_rekeying);
     try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
@@ -3467,7 +3468,7 @@ test "handlePacket: direct-tcpip open emits request and accept confirms" {
 
     const chan = m.session.channel_table.findByLocalId(channel_id).?;
     try std.testing.expectEqual(ChannelType.DirectTcpip, chan.channel_type);
-    try std.testing.expectEqual(ChannelState.Open, chan.state);
+    try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
 
     try m.acceptChannelOpen(channel_id);
     const data = try m.peek(Protocol.MaxSSHPacket);
@@ -3514,9 +3515,9 @@ test "handlePacket: session open requires an application decision" {
     };
     const chan = m.session.channel_table.findByLocalId(channel_id).?;
     try std.testing.expectEqual(ChannelType.Session, chan.channel_type);
-    try std.testing.expectEqual(ChannelState.Open, chan.state);
+    try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
     try std.testing.expectError(IoError.badClearEvent, m.clearEvent(event_code));
-    try std.testing.expectEqual(ChannelState.Open, chan.state);
+    try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
 
     try m.acceptChannelOpen(channel_id);
     const data = try m.peek(Protocol.MaxSSHPacket);
@@ -3559,6 +3560,7 @@ test "rejectChannelOpen writes caller-provided failure" {
         else => return error.TestUnexpectedResult,
     };
 
+    try std.testing.expectEqual(ChannelState.OpenPending, m.session.channel_table.findByLocalId(channel_id).?.state);
     try m.rejectChannelOpen(channel_id, SshOpenFailureReason.ConnectFailed, "connect failed");
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_id) == null);
 
@@ -3568,6 +3570,161 @@ test "rejectChannelOpen writes caller-provided failure" {
     try std.testing.expectEqual(@as(u32, 88), try rdr.readU32());
     try std.testing.expectEqual(SshOpenFailureReason.ConnectFailed, try rdr.readU32());
     try std.testing.expectEqualStrings("connect failed", try rdr.readU32LenString());
+}
+
+test "server pending inbound open refuses peer messages regardless of outbound mode" {
+    const Message = enum { data, extended_data, eof, close, window_adjust, shell, unknown_request };
+    for (std.enums.values(@import("channel.zig").ClientChannelOpenMode)) |mode| {
+        for (std.enums.values(Message)) |message| {
+            var prng = std.Random.DefaultPrng.init(42);
+            var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+            defer m.deinit();
+            m.session.user_authenticated = true;
+            m.session.setSessionState(.Authenticated);
+
+            const channel_id = try requestServerDirectTcpipOpenForTest(&m, 88);
+            const chan = m.session.channel_table.findByLocalId(channel_id).?;
+            try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
+            try std.testing.expect(chan.remote_id_known);
+            chan.client_open_mode = mode;
+            const local_window = chan.local_window;
+            const peer_window = chan.peer_window;
+            const write_state = m.iostate_wr;
+            const read_state = m.iostate_rd;
+            const io_state = m.session.ioSessionState;
+            try std.testing.expect(m.session.active_channel_id == null);
+
+            switch (message) {
+                .data => try std.testing.expectError(IoError.UnexpectedResponse, deliverServerChannelDataForTest(&m, channel_id, "revive")),
+                .extended_data => try std.testing.expectError(IoError.UnexpectedResponse, deliverServerChannelExtendedDataForTest(&m, channel_id, "revive")),
+                .eof => try std.testing.expectError(IoError.UnexpectedResponse, deliverServerChannelControlForTest(&m, .SSH_MSG_CHANNEL_EOF, channel_id)),
+                .close => try std.testing.expectError(IoError.UnexpectedResponse, deliverServerChannelControlForTest(&m, .SSH_MSG_CHANNEL_CLOSE, channel_id)),
+                .window_adjust => try std.testing.expectError(IoError.UnexpectedResponse, deliverServerWindowAdjustForTest(&m, channel_id, 5)),
+                .shell => try deliverServerChannelRequestForTest(&m, channel_id, "shell", true, ""),
+                .unknown_request => try deliverServerChannelRequestForTest(&m, channel_id, "unknown@example", true, ""),
+            }
+
+            try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
+            try std.testing.expectEqual(local_window, chan.local_window);
+            try std.testing.expectEqual(peer_window, chan.peer_window);
+            try std.testing.expect(!chan.eof_received);
+            try std.testing.expect(!chan.close_received);
+            try std.testing.expect(!chan.eof_pending);
+            try std.testing.expect(!chan.close_pending);
+            try std.testing.expectEqual(@as(usize, 0), chan.write_buf_nbytes);
+            try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
+            try std.testing.expect(m.session.active_channel_id == null);
+            try std.testing.expect(std.meta.eql(write_state, m.iostate_wr));
+            try std.testing.expect(std.meta.eql(read_state, m.iostate_rd));
+            const expected_io_state = switch (message) {
+                .shell, .unknown_request => Protocol.IoSessionState.ReadPktHdr,
+                else => io_state,
+            };
+            try std.testing.expectEqual(expected_io_state, m.session.ioSessionState);
+            try std.testing.expect(!m.terminated);
+        }
+    }
+}
+
+test "server pending inbound decision idles and defers acceptance or rejection during rekey" {
+    for (std.enums.values(@import("channel.zig").ClientChannelOpenMode)) |mode| {
+        for ([_]bool{ true, false }) |accept| {
+            var prng = std.Random.DefaultPrng.init(42);
+            var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+            defer m.deinit();
+            m.session.user_authenticated = true;
+            m.session.setSessionState(.Authenticated);
+
+            const channel_id = try requestServerDirectTcpipOpenForTest(&m, 88);
+            const chan = m.session.channel_table.findByLocalId(channel_id).?;
+            chan.client_open_mode = mode;
+            const write_state = m.iostate_wr;
+            try std.testing.expect(m.session.channel_table.findNextRunnable() == null);
+            m.session.active_channel_id = channel_id;
+            try m.session.advanceChannel(&m, &m.session.keydata.s2c);
+            try std.testing.expectEqual(ChannelState.OpenPending, chan.state);
+            try std.testing.expectEqual(Protocol.IoSessionState.ReadPktHdr, m.session.ioSessionState);
+            try std.testing.expect(std.meta.eql(write_state, m.iostate_wr));
+
+            m.session.session_id_established = true;
+            m.session.is_rekeying = true;
+            m.session.rekey_resume_state = .ChannelActive;
+            m.session.setSessionState(.KexInitRead);
+            if (accept) {
+                try m.acceptChannelOpen(channel_id);
+                try std.testing.expectEqual(ChannelState.ConfirmWrite, chan.state);
+            } else {
+                try m.rejectChannelOpen(channel_id, SshOpenFailureReason.AdministrativelyProhibited, "denied");
+                try std.testing.expectEqual(ChannelState.OpenFailureWrite, chan.state);
+            }
+            try std.testing.expect(!chan.canReceiveRequestPacket());
+            try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
+            try std.testing.expect(m.iostate_wr == .Idle);
+
+            m.session.is_rekeying = false;
+            m.session.rekey_resume_state = null;
+            m.session.setSessionState(.ChannelActive);
+            m.session.setIoSessionState(.Idle);
+            m.iostate_rd = .Idle;
+            try m.advance();
+            const packet = try m.peek(Protocol.MaxSSHPacket);
+            var reader = BufferReader.init(unencryptedPayload(packet));
+            const expected: Protocol.MsgId = if (accept) .SSH_MSG_CHANNEL_OPEN_CONFIRMATION else .SSH_MSG_CHANNEL_OPEN_FAILURE;
+            try std.testing.expectEqual(@intFromEnum(expected), try reader.readU8());
+            try std.testing.expectEqual(@as(u32, 88), try reader.readU32());
+            if (accept) {
+                try std.testing.expectEqual(channel_id, try reader.readU32());
+                try std.testing.expectEqual(ChannelState.Data, chan.state);
+            } else {
+                try std.testing.expectEqual(SshOpenFailureReason.AdministrativelyProhibited, try reader.readU32());
+                try std.testing.expectEqualStrings("denied", try reader.readU32LenString());
+                try std.testing.expect(m.session.channel_table.findByLocalId(channel_id) == null);
+            }
+        }
+    }
+}
+
+test "server accept and reject cannot decide an outbound agent Open channel" {
+    for ([_]bool{ true, false }) |accept| {
+        var prng = std.Random.DefaultPrng.init(42);
+        var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+        defer m.deinit();
+        const channel_id = try m.session.openAgentChannel();
+        const chan = m.session.channel_table.findByLocalId(channel_id).?;
+        try std.testing.expectEqual(ChannelState.Open, chan.state);
+        try std.testing.expect(!chan.remote_id_known);
+        try std.testing.expect(!chan.canReceiveRequestPacket());
+        const active_channel_id = m.session.active_channel_id;
+        const session_state = m.session.sessionState;
+        const io_state = m.session.ioSessionState;
+        const write_state = m.iostate_wr;
+        const read_state = m.iostate_rd;
+        const reason = chan.open_failure_reason_code;
+        const description = chan.open_failure_description;
+
+        if (accept) {
+            try std.testing.expectError(IoError.UnexpectedResponse, m.session.acceptChannelOpen(channel_id));
+        } else {
+            try std.testing.expectError(IoError.UnexpectedResponse, m.session.rejectChannelOpen(channel_id, SshOpenFailureReason.AdministrativelyProhibited, "denied"));
+        }
+        try std.testing.expectEqual(ChannelState.Open, chan.state);
+        try std.testing.expectEqual(reason, chan.open_failure_reason_code);
+        try std.testing.expectEqualStrings(description, chan.open_failure_description);
+        try std.testing.expectEqual(active_channel_id, m.session.active_channel_id);
+        try std.testing.expectEqual(session_state, m.session.sessionState);
+        try std.testing.expectEqual(io_state, m.session.ioSessionState);
+        try std.testing.expect(std.meta.eql(write_state, m.iostate_wr));
+        try std.testing.expect(std.meta.eql(read_state, m.iostate_rd));
+
+        try m.advance();
+        try std.testing.expectEqual(ChannelState.OpenSent, chan.state);
+        try std.testing.expect(!chan.remote_id_known);
+        const packet = try m.peek(Protocol.MaxSSHPacket);
+        var reader = BufferReader.init(unencryptedPayload(packet));
+        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try reader.readU8());
+        try std.testing.expectEqualStrings(Protocol.channel_type_auth_agent_openssh, try reader.readU32LenString());
+        try std.testing.expectEqual(channel_id, try reader.readU32());
+    }
 }
 
 test "server rejected inbound open during rekey rejects confirmation" {
@@ -3735,7 +3892,7 @@ test "server channel requests while closing or pending open do not tear down" {
     }
 
     const pending = m.session.channel_table.allocChannelKind(.Session, 61, 32768, 32768).?;
-    pending.state = .Open;
+    pending.state = .OpenPending;
     var pty_payload_buf: [64]u8 = undefined;
     var pty_payload = BufferWriter.init(&pty_payload_buf, 0);
     try pty_payload.writeU32LenString("xterm");

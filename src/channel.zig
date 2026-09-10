@@ -71,6 +71,8 @@ pub const TcpipOpen = struct {
 pub const ChannelState = enum {
     OpenWrite,
     Open,
+    /// Inbound open awaiting acceptance or rejection; also the fail-closed allocation default.
+    OpenPending,
     OpenSent,
     ConfirmWrite,
     RspWrite,
@@ -173,7 +175,7 @@ pub const Channel = struct {
             .tcpip_open = .{},
             .open_failure_reason_code = 4,
             .open_failure_description = "too many channels",
-            .state = .Open,
+            .state = .OpenPending,
         };
     }
 
@@ -218,13 +220,10 @@ pub const Channel = struct {
     fn establishedForReceive(self: *const Self) bool {
         if (!self.remote_id_known) return false;
         return switch (self.state) {
-            // The client uses `.Open` after an outbound session open is
-            // confirmed and automatic setup is pending. Server-side inbound
-            // opens never assign `client_open_mode`, so they keep the
-            // `.RawSession` default and remain non-receiving until accepted.
-            .Open => self.client_open_mode != .RawSession,
-            .Connected, .Data, .DataRx, .DataTx, .DataTxComplete, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite => true,
-            .OpenWrite, .OpenSent, .ConfirmWrite, .Closed, .OpenFailureWrite => false,
+            // Confirmed outbound `.Open` channels may receive during automatic
+            // setup. Undecided inbound opens are explicitly `.OpenPending`.
+            .Open, .Connected, .Data, .DataRx, .DataTx, .DataTxComplete, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite => true,
+            .OpenPending, .OpenWrite, .OpenSent, .ConfirmWrite, .Closed, .OpenFailureWrite => false,
         };
     }
 
@@ -442,7 +441,7 @@ pub const ChannelTable = struct {
             .Connected => true,
             .Data => true,
             .DataTx, .DataTxComplete => true,
-            .DataRx, .Open, .OpenSent, .Closed => false,
+            .DataRx, .Open, .OpenPending, .OpenSent, .Closed => false,
         };
     }
 
@@ -586,7 +585,42 @@ test "Channel init sets default values" {
     try std.testing.expectEqual(@as(u32, 0), ch.tcpip_open.originator_port);
     try std.testing.expectEqual(@as(u32, 4), ch.open_failure_reason_code);
     try std.testing.expectEqualStrings("too many channels", ch.open_failure_description);
-    try std.testing.expectEqual(ChannelState.Open, ch.state);
+    try std.testing.expectEqual(ChannelState.OpenPending, ch.state);
+}
+
+test "pending inbound opens are non-receiving and idle regardless of outbound mode" {
+    for (std.enums.values(ClientChannelOpenMode)) |mode| {
+        var table = ChannelTable{};
+        const ch = table.allocChannel(42, 32768, 4096).?;
+        ch.client_open_mode = mode;
+        try std.testing.expectEqual(ChannelState.OpenPending, ch.state);
+        try std.testing.expect(ch.remote_id_known);
+        try std.testing.expect(!ch.expectsOpenReply());
+        try std.testing.expect(!ch.canReceiveDataPacket());
+        try std.testing.expect(!ch.canReceiveEofPacket());
+        try std.testing.expect(!ch.canReceiveClosePacket());
+        try std.testing.expect(!ch.canReceiveRequestPacket());
+        try std.testing.expect(!ch.canReceiveWindowAdjustPacket());
+
+        ch.local_window = 0;
+        try std.testing.expect(ch.needsWindowAdjust());
+        try std.testing.expect(table.findNextRunnable() == null);
+        try std.testing.expect(table.findNextDeferredWrite() == null);
+        try std.testing.expect(table.findNextWindowAdjust() == null);
+
+        ch.state = .Open;
+        try std.testing.expect(ch.canReceiveEofPacket());
+        try std.testing.expect(ch.canReceiveClosePacket());
+        try std.testing.expect(ch.canReceiveRequestPacket());
+        try std.testing.expect(ch.canReceiveWindowAdjustPacket());
+        try std.testing.expect(!ch.canReceiveDataPacket());
+
+        ch.remote_id_known = false;
+        try std.testing.expect(!ch.canReceiveEofPacket());
+        try std.testing.expect(!ch.canReceiveClosePacket());
+        try std.testing.expect(!ch.canReceiveRequestPacket());
+        try std.testing.expect(!ch.canReceiveWindowAdjustPacket());
+    }
 }
 
 test "ChannelType maps SSH names" {
@@ -667,7 +701,7 @@ test "findNextRunnable round-robin alternates between two runnable channels" {
 
 test "findNextRunnable returns single runnable regardless of cursor" {
     var table = ChannelTable{};
-    _ = table.allocChannel(10, 32768, 32768); // slot 0, state Open (not runnable)
+    _ = table.allocChannel(10, 32768, 32768); // slot 0, state OpenPending (not runnable)
     const ch1 = table.allocChannel(20, 32768, 32768).?; // slot 1
     ch1.state = .Data;
 
