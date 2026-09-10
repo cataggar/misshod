@@ -45,7 +45,7 @@ const default_channel_capacity: u8 = 4;
 /// `-Dversion=${GITHUB_REF_NAME#v}` and stamps its own tag. This fallback
 /// tracks the version declared in `build.zig.zon` so an untagged build
 /// still reports something truthful.
-const default_version = "0.2.0";
+const default_version = "0.2.1";
 
 /// Emitted as a name rather than the enum itself so `util.zig` keeps one
 /// definition of the level and maps onto it explicitly.
