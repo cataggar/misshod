@@ -124,6 +124,9 @@ pub const ResourceCapacities = struct {
     pub const rekey_after_encrypted_packets: u64 = 1 << 30;
     pub const outstanding_global_requests: u8 = 1;
     pub const decompressed_payload_size: usize = Protocol.MaxPayload;
+    pub const server_exit_signal_name: usize = 64;
+    pub const server_exit_error_message: usize = 1024;
+    pub const server_exit_language_tag: usize = 64;
 };
 
 pub const ResourceLimits = struct {
@@ -623,6 +626,19 @@ pub const ChannelExitResult = union(enum) {
     NoResult,
 };
 
+pub const ServerChannelExitTransmission = enum {
+    Queued,
+    Emitting,
+    HandedToTransport,
+};
+
+/// Value-owned local submission facts, not peer receipt or application success.
+pub const ServerChannelExitStatus = struct {
+    channel: u32,
+    transmission: ServerChannelExitTransmission,
+    abandoned: bool = false,
+};
+
 pub const TcpipForwardRequest = struct {
     bind_address: []const u8,
     bind_port: u32,
@@ -783,6 +799,19 @@ pub const WindowSize = struct {
     height_px: u32,
 };
 
+/// Borrowed until acceptPtyRequest/rejectPtyRequest. Modes include the entire
+/// RFC 4254 terminal-modes string, without interpretation or truncation.
+pub const PtyRequest = struct {
+    channel: u32,
+    term: []const u8,
+    cols: u32,
+    rows: u32,
+    width_px: u32,
+    height_px: u32,
+    modes: []const u8,
+    want_reply: bool,
+};
+
 pub const ChannelSignal = struct {
     /// Server events are emitted only for an accepted `Session` channel.
     channel: u32,
@@ -811,6 +840,8 @@ pub const SshzServerEventCodes = union(enum) {
     AgentChannelClosed: u32,
     RxData: ChannelData,
     RxExtendedData: ChannelExtendedData,
+    PtyRequest: PtyRequest,
+    ChannelEof: u32,
     WindowChange: WindowSize,
     Signal: ChannelSignal,
     ChannelRequest: ChannelRequestEvent,
@@ -1275,7 +1306,7 @@ pub fn SshzImpl(role: Role) type {
 
         // for session use
         pub fn requestEvent(self: *Self, code: eventCodeType(role), next_state: Protocol.IoSessionState) void {
-            if (role == .Client and code == .EndSession) self.session.endSessionRequests();
+            if (code == .EndSession) self.session.endSessionRequests();
             self.iostate_wr = .{ .Active = .{
                 .action = .{ .Eventing = code },
                 .next_state = next_state,
@@ -1356,7 +1387,7 @@ pub fn SshzImpl(role: Role) type {
                                 }
                                 if (comptime role == .Server) {
                                     switch (eventCode) {
-                                        .TcpipForward, .CancelTcpipForward, .ChannelOpenRequest => return IoError.badClearEvent,
+                                        .TcpipForward, .CancelTcpipForward, .ChannelOpenRequest, .PtyRequest => return IoError.badClearEvent,
                                         .UserAuth => {
                                             if (self.session.sessionState == .CheckUserPasswordAuth) {
                                                 try self.session.decideAuthorization(.Deny);
@@ -1551,12 +1582,10 @@ pub fn SshzImpl(role: Role) type {
                                 }
                             },
                             .WriteCompletePreserveState => {
-                                if (role == .Client) {
-                                    self.session.completePreservedWrite(self) catch |err| {
-                                        self.failClosed();
-                                        return err;
-                                    };
-                                }
+                                self.session.completePreservedWrite(self) catch |err| {
+                                    self.failClosed();
+                                    return err;
+                                };
                             },
                             .ChannelWriteComplete => |channel_id| {
                                 self.session.completeChannelWrite(channel_id, self) catch |err| {
@@ -1793,10 +1822,9 @@ pub fn SshzImpl(role: Role) type {
             errdefer self.failClosed();
             if (role == .Client) {
                 _ = try self.session.flushPendingWindowChange(self);
-                // Receive credit may be queued while another packet owns the
-                // write side, even though a packet-header read is still active.
-                _ = try self.session.flushPendingChannelWindowAdjust(self);
             }
+            // Credit can be queued behind output while a packet read is active.
+            _ = try self.session.flushPendingChannelWindowAdjust(self);
             const inkeys = switch (role) {
                 .Client => &self.session.keydata.s2c,
                 .Server => &self.session.keydata.c2s,
@@ -1897,22 +1925,18 @@ pub fn SshzImpl(role: Role) type {
             };
         }
 
-        /// Returns receive-window credit for an ordinary client channel.
+        /// Returns receive-window credit for an ordinary channel in either role.
         ///
         /// This is valid only after automatic channel read credit has been
         /// disabled and no more than the bytes delivered through borrowed
         /// `RxData` or `RxExtendedData` events may be credited.
         pub fn channelReadConsumed(self: *Self, channel_id: u32, count: usize) SshzError!void {
-            return switch (role) {
-                .Client => {
-                    self.session.channelReadConsumed(channel_id, count, self) catch |err| {
-                        self.latchKeyLifetimeError(err);
-                        return err;
-                    };
-                    try self.advance();
-                },
-                .Server => IoError.UnimplementedService,
+            if (self.terminated) return IoError.SessionTerminated;
+            self.session.channelReadConsumed(channel_id, count, self) catch |err| {
+                self.latchKeyLifetimeError(err);
+                return err;
             };
+            try self.advance();
         }
 
         pub fn openSessionChannel(self: *Self) SshzError!u32 {
@@ -1976,9 +2000,71 @@ pub fn SshzImpl(role: Role) type {
         /// Disable this before opening channels to return credit explicitly with
         /// `channelReadConsumed`. Agent channels retain automatic credit.
         pub fn setAutoChannelReadCreditEnabled(self: *Self, enabled: bool) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            try self.session.setAutoChannelReadCreditEnabled(enabled);
+        }
+
+        /// Enables explicit server PTY admission and received-EOF events.
+        /// Set before authentication. Disabled by default; client unsupported.
+        pub fn setServerChannelEventsEnabled(self: *Self, enabled: bool) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             return switch (role) {
-                .Client => try self.session.setAutoChannelReadCreditEnabled(enabled),
-                .Server => IoError.UnimplementedService,
+                .Client => IoError.UnimplementedService,
+                .Server => self.session.setServerChannelEventsEnabled(enabled),
+            };
+        }
+
+        /// Submits the borrowed channel write buffer as extended data (1=stderr).
+        /// cannotAcceptWrite accepts no bytes; retry only after protocol pumping.
+        pub fn channelExtendedWriteComplete(self: *Self, channel_id: u32, data_type: u32, nbytes: usize) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            if (role == .Client) return IoError.UnimplementedService;
+            if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+            self.updateLocalRekeyPending(null);
+            self.session.channelExtendedWriteComplete(channel_id, data_type, nbytes, self) catch |err| {
+                self.latchKeyLifetimeError(err);
+                return err;
+            };
+            _ = self.maybeStartLocalRekey();
+            try self.advance();
+        }
+
+        fn submitServerExit(self: *Self, channel_id: u32, result: ChannelExitResult) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            if (role == .Client) return IoError.UnimplementedService;
+            self.updateLocalRekeyPending(null);
+            self.session.sendChannelExitResult(channel_id, result, self) catch |err| {
+                self.latchKeyLifetimeError(err);
+                return err;
+            };
+            _ = self.maybeStartLocalRekey();
+            try self.advance();
+        }
+
+        /// Queues one real exit-status after accepted data and before later EOF.
+        /// Does not itself send EOF/CLOSE. Further data/results are rejected.
+        pub fn sendChannelExitStatus(self: *Self, channel_id: u32, status: u32) SshzError!void {
+            try self.submitServerExit(channel_id, .{ .Status = status });
+        }
+
+        /// Copies all signal strings before returning; see ResourceCapacities.
+        pub fn sendChannelExitSignal(self: *Self, channel_id: u32, signal: ChannelExitSignal) SshzError!void {
+            try self.submitServerExit(channel_id, .{ .Signal = signal });
+        }
+
+        /// Retained local facts. Handoff means consumed(), not actual TCP flush.
+        pub fn serverChannelExitStatus(self: *const Self, channel_id: u32) ?ServerChannelExitStatus {
+            return switch (role) {
+                .Client => null,
+                .Server => self.session.serverChannelExitStatus(channel_id),
+            };
+        }
+
+        /// Releases a retained result after channel removal or session end.
+        pub fn clearServerChannelExitStatus(self: *Self, channel_id: u32) bool {
+            return switch (role) {
+                .Client => false,
+                .Server => self.session.clearServerChannelExitStatus(channel_id),
             };
         }
 
@@ -2313,6 +2399,39 @@ pub fn SshzImpl(role: Role) type {
             try self.clearPendingChannelOpenRequest(channel_id);
             try self.session.acceptChannelOpen(channel_id);
             try self.advance();
+        }
+
+        fn decidePtyRequest(self: *Self, channel_id: u32, allow: bool) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            if (role == .Client) return IoError.UnimplementedService;
+            const pending = switch (self.iostate_wr) {
+                .Idle => return IoError.badClearEvent,
+                .Active => |active| active,
+            };
+            const request = switch (pending.action) {
+                .Eventing => |event| switch (event) {
+                    .PtyRequest => |request| request,
+                    else => return IoError.badClearEvent,
+                },
+                else => return IoError.cannotAcceptWrite,
+            };
+            if (request.channel != channel_id) return IoError.badClearEvent;
+            try self.session.decidePtyRequest(channel_id, request.want_reply, allow);
+            self.session.setIoSessionState(pending.next_state);
+            self.iostate_wr = .Idle;
+            self.scrubReceiveBuffers();
+            try self.advance();
+        }
+
+        /// Releases the borrowed PTY request and sends success iff requested.
+        pub fn acceptPtyRequest(self: *Self, channel_id: u32) SshzError!void {
+            try self.decidePtyRequest(channel_id, true);
+        }
+
+        /// Releases the borrowed PTY request and sends failure iff requested.
+        /// Does not close the channel; the application may close it explicitly.
+        pub fn rejectPtyRequest(self: *Self, channel_id: u32) SshzError!void {
+            try self.decidePtyRequest(channel_id, false);
         }
 
         pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) SshzError!void {

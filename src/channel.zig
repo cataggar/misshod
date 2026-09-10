@@ -115,6 +115,9 @@ pub const Channel = struct {
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
     tx_in_flight_len: usize,
+    write_data_type: ?u32 = null,
+    server_exit_submitted: bool = false,
+    server_exit_pending: bool = false,
     eof_pending: bool,
     close_pending: bool,
     control_in_flight: ?ChannelControl,
@@ -410,7 +413,7 @@ pub const ChannelTable = struct {
                 const tx_ready = ch.remote_id_known and ch.write_buf_nbytes > 0 and ch.tx_in_flight_len == 0 and ch.peer_window > 0;
                 const control_ready = ch.remote_id_known and ch.write_buf_nbytes == 0 and ch.tx_in_flight_len == 0 and
                     ch.control_in_flight == null and
-                    ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
+                    (ch.server_exit_pending or (ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
                 const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
                 const window_adjust_ready = ch.remote_id_known and ch.state == .DataRx and
                     !ch.eof_received and !ch.close_pending and !ch.close_sent and !ch.close_received and
@@ -432,7 +435,7 @@ pub const ChannelTable = struct {
                 const tx_ready = ch.remote_id_known and ch.write_buf_nbytes > 0 and ch.tx_in_flight_len == 0 and ch.peer_window > 0;
                 const control_ready = ch.remote_id_known and ch.write_buf_nbytes == 0 and ch.tx_in_flight_len == 0 and
                     ch.control_in_flight == null and
-                    ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
+                    (ch.server_exit_pending or (ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
                 const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
                 const window_adjust_ready = ch.remote_id_known and ch.state == .DataRx and
                     !ch.eof_received and !ch.close_pending and !ch.close_sent and !ch.close_received and

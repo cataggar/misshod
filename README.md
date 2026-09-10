@@ -13,6 +13,8 @@ ordered byte stream.
 - Explicit acknowledged keepalives with owned request tokens and transport-flush accounting
 - Client-side cancellation of queued, unframed channel data without closing the channel
 - Opt-in automatic exec acknowledgment, independent of output and command exit results
+- Opt-in server PTY admission and EOF observation, manual receive credit,
+  extended output, and owned exit-status/signal submission
 - Interoperability coverage with OpenSSH, Dropbear, and libssh
 
 The authoritative algorithm list and negotiation rules are in the

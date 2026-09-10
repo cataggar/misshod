@@ -32,6 +32,8 @@ control.
 | automatic rekey after key age | disabled until configured in caller clock ticks |
 | outstanding global requests | 1 |
 | decompressed packet payload | 34,708 bytes |
+| retained server exit submissions | configured channel count |
+| submitted exit-signal name / message / language tag | 64 / 1,024 / 64 bytes |
 | handshake, authentication, idle, total deadlines | disabled |
 
 ## Compile-time channel capacity
@@ -55,17 +57,17 @@ must be between 1 and 255.
 Increasing the capacity increases every client and server session's fixed
 storage even when fewer channels are active. Each channel slot includes a
 34,653-byte write buffer, aggregate pending-write capacity is
-`channel_capacity * 34,653`, and client exit-result and pending-reply tables
+`channel_capacity * 34,653`, and client/server exit-result and pending-reply tables
 also scale with the capacity. Embedders should account for this linear growth
 when deciding whether to place session values on the stack or heap.
 
 ## Application-controlled receive credit
 
-Client ordinary channels automatically replenish their receive windows by
-default, preserving existing behavior. A bounded forwarding application can
+Client and server ordinary channels automatically replenish their receive
+windows by default, preserving existing behavior. A bounded forwarding application can
 call `setAutoChannelReadCreditEnabled(false)` before channels open, then return
-credit per channel with `channelReadConsumed(channel_id, count)` only after it
-has consumed or durably buffered those bytes. Agent channels remain automatic.
+credit per channel with `channelReadConsumed(channel_id, count)` only after
+those bytes leave its bounded receive storage. Agent channels remain automatic.
 
 In manual mode, clearing `RxData` or `RxExtendedData` releases the borrowed
 packet storage but does not increase the peer's window. sshz tracks
@@ -83,6 +85,14 @@ throughput choice, not an appropriate implicit bound for an application whose
 socket-side buffer is smaller. Manual credit adds only fixed counters to each
 compiled channel slot; it does not add an unbounded queue or socket buffering
 inside sshz.
+
+Server exit submissions use a separate fixed control-payload slot per compiled
+channel capacity, not the channel-data budget. Signal strings are copied within
+the published bounds above; the complete encoded request must also fit the
+configured payload limit, conservatively allowing for compression. Retained
+submissions are never evicted: clear completed statuses to make room for later
+channels. PTY terminal and modes strings borrow the bounded received packet;
+there is no additional unbounded allocation or implicit modes truncation.
 
 The default client authentication strategy remains separately bounded as
 before. The server count includes unsupported, probe, and failed requests so a
