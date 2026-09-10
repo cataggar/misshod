@@ -211,6 +211,49 @@ pub const Channel = struct {
             self.control_in_flight == null;
     }
 
+    pub fn expectsOpenReply(self: *const Self) bool {
+        return self.state == .OpenSent;
+    }
+
+    fn establishedForReceive(self: *const Self) bool {
+        if (!self.remote_id_known) return false;
+        return switch (self.state) {
+            // The client uses `.Open` after an outbound session open is
+            // confirmed and automatic setup is pending. Server-side inbound
+            // opens never assign `client_open_mode`, so they keep the
+            // `.RawSession` default and remain non-receiving until accepted.
+            .Open => self.client_open_mode != .RawSession,
+            .Connected, .Data, .DataRx, .DataTx, .DataTxComplete, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite => true,
+            .OpenWrite, .OpenSent, .ConfirmWrite, .Closed, .OpenFailureWrite => false,
+        };
+    }
+
+    pub fn canReceiveDataPacket(self: *const Self) bool {
+        // `.Data` is accepted alongside `.DataRx` because a rekey may service
+        // the next packet before `advanceChannel` normalizes a cleared data
+        // event from `.Data` back to `.DataRx`. Both are established states,
+        // so this widens the window only for channels already carrying data.
+        return self.establishedForReceive() and
+            (self.state == .DataRx or self.state == .Data) and
+            !self.close_received;
+    }
+
+    pub fn canReceiveEofPacket(self: *const Self) bool {
+        return self.establishedForReceive() and !self.close_received;
+    }
+
+    pub fn canReceiveClosePacket(self: *const Self) bool {
+        return self.establishedForReceive() and !self.close_received;
+    }
+
+    pub fn canReceiveRequestPacket(self: *const Self) bool {
+        return self.establishedForReceive();
+    }
+
+    pub fn canReceiveWindowAdjustPacket(self: *const Self) bool {
+        return self.establishedForReceive() and !self.close_received;
+    }
+
     pub fn consumeLocalWindow(self: *Self, len: usize) ChannelError!void {
         if (len > self.local_max_packet_size) return error.ChannelPacketTooLarge;
         if (len > self.local_window) return error.ReceiveWindowExceeded;

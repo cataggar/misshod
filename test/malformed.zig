@@ -446,6 +446,7 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
             client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
+            channel.state = .DataRx;
             channel.close_sent = true;
         },
         else => unreachable,
