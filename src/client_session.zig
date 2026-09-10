@@ -131,7 +131,7 @@ pub const Session = struct {
     pending_channel_replies: [MaxChannels]PendingChannelReply,
     pending_channel_replies_head: usize,
     pending_channel_replies_len: usize,
-    pending_window_change: ?[4]u32,
+    pending_automatic_window_change: ?[4]u32,
     channel_window_adjust_in_flight: bool,
     pending_global_request: ?PendingGlobalRequest,
     keepalive: ?Sshz.KeepaliveStatus = null,
@@ -212,7 +212,7 @@ pub const Session = struct {
             .pending_channel_replies = undefined,
             .pending_channel_replies_head = 0,
             .pending_channel_replies_len = 0,
-            .pending_window_change = null,
+            .pending_automatic_window_change = null,
             .channel_window_adjust_in_flight = false,
             .pending_global_request = null,
             .agent_forwarding_enabled = false,
@@ -1048,6 +1048,10 @@ pub const Session = struct {
                 const mode: ClientChannelOpenMode = if (self.auto_exec_command != null) .AutoExec else .AutoShell;
                 const chan = try self.allocateClientSessionChannel(mode);
                 self.automatic_session_channel_id = chan.local_id;
+                if (self.pending_automatic_window_change) |size| {
+                    self.channel_table.queueWindowChange(chan, size);
+                    self.pending_automatic_window_change = null;
+                }
                 if (mode == .AutoExec and self.auto_exec_ack_enabled) {
                     if (self.auto_exec_ack.outcome != .NotRequested) return IoError.UnexpectedResponse;
                     self.auto_exec_ack = .{ .channel = chan.local_id, .outcome = .Pending };
@@ -1669,7 +1673,7 @@ pub const Session = struct {
         if (!queued) _ = try self.dispatchDeferredChannelWrite(sshz);
     }
 
-    /// Sends a queued `window-change` for the session channel, if one is due.
+    /// Sends the next ready channel's coalesced `window-change`, if one is due.
     ///
     /// Completion preserves the live receive state, not a snapshot taken when
     /// the resize was framed. A concurrent read may finish before this write;
@@ -1677,23 +1681,15 @@ pub const Session = struct {
     ///
     /// The request is cleared before the write so a failure cannot leave it
     /// retrying against a channel that is going away, and a resize that lands
-    /// while one is in flight simply replaces it — only the latest size matters.
+    /// while one is in flight replaces only that channel's pending size, not
+    /// the already-framed packet or another channel's pending size.
     fn startPendingWindowChange(
         self: *Self,
         sshz: *SshzClient,
         outkeys: *Protocol.KeyDataUni,
     ) SshzError!bool {
-        if (self.pending_window_change == null) return false;
-
-        const chan = self.channel_table.findByKind(.Session) orelse return false;
-        if (!chan.remote_id_known or chan.tx_in_flight_len != 0 or
-            chan.close_pending or chan.close_sent or chan.close_received)
-        {
-            return false;
-        }
-
-        const wc = self.pending_window_change.?;
-        self.pending_window_change = null;
+        const chan = self.channel_table.findNextWindowChange() orelse return false;
+        const wc = self.channel_table.takePendingWindowChange(chan).?;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
         try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
@@ -1721,7 +1717,7 @@ pub const Session = struct {
     /// is tracked separately from the read side and is free in that state, so
     /// there is nothing to wait for.
     pub fn flushPendingWindowChange(self: *Self, sshz: *SshzClient) SshzError!bool {
-        if (self.pending_window_change == null) return false;
+        if (!self.channel_table.hasPendingWindowChanges()) return false;
         if (self.pending_channel_replies_len != 0 or
             self.sessionState != .ChannelActive or self.is_rekeying or
             sshz.local_rekey_pending or sshz.iostate_wr != .Idle or
@@ -1953,20 +1949,55 @@ pub const Session = struct {
         self.endAutoExecAck(channel_id);
         if (chan.close_sent or chan.close_pending) return;
         chan.close_pending = true;
+        self.channel_table.discardPendingWindowChange(chan);
         chan.eof_pending = false;
         if (chan.tx_in_flight_len == 0) chan.discardWriteBuffer();
         _ = try self.startPendingChannelControl(chan, sshz, &self.keydata.c2s);
     }
 
-    /// Queues a `window-change` request for the session channel.
+    /// Queues the latest size for the automatic shell/exec channel only.
     ///
-    /// Only queues: the request goes out from `dispatchDeferredChannelWrite`,
-    /// which is the point in `advance` where interjecting a packet is safe. A
-    /// terminal is normally resized while nothing is being transmitted, so the
-    /// caller is almost always arriving mid-read, and stealing the state
-    /// machine then would abandon a read the transport is still expecting.
+    /// Calls before allocation coalesce in one early slot, transferred once
+    /// at automatic channel creation. Setup defers sending. Later calls share
+    /// the channel's slot with sendChannelWindowChange: latest call wins.
+    /// Obsolete work is discarded with a metadata-only debug trace, never
+    /// retargeted. Only flushPendingWindowChange may frame the queued request;
+    /// queuing does not disturb an outstanding read or active channel.
     pub fn sendWindowChange(self: *Self, cols: u32, rows: u32, width_px: u32, height_px: u32) void {
-        self.pending_window_change = .{ cols, rows, width_px, height_px };
+        if (!self.auto_session_enabled or self.global_requests_ended) {
+            TRACE(.Debug, "discarding automatic window-change without an automatic session", .{});
+            return;
+        }
+        if (self.automatic_session_channel_id) |id| {
+            if (self.channel_table.findByLocalId(id)) |chan| {
+                // The retained public ID can wrap and be reused after removal.
+                if (chan.client_open_mode != .RawSession and chan.canRetainWindowChange()) {
+                    self.channel_table.queueWindowChange(chan, .{ cols, rows, width_px, height_px });
+                    return;
+                }
+            }
+            TRACE(.Debug, "discarding automatic window-change for obsolete channel {d}", .{id});
+            return;
+        }
+        self.pending_automatic_window_change = .{ cols, rows, width_px, height_px };
+    }
+
+    /// Queues one latest size for an established session channel. Unlike the
+    /// automatic convenience API, explicit targets must have completed setup.
+    pub fn sendChannelWindowChange(self: *Self, channel_id: u32, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
+        if (self.global_requests_ended) return IoError.SessionTerminated;
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (!chan.canRetainWindowChange() or
+            (!chan.canSendChannelRequest() and chan.state != .EofWrite))
+            return IoError.UnexpectedResponse;
+        self.channel_table.queueWindowChange(chan, .{ cols, rows, width_px, height_px });
+    }
+
+    fn discardEarlyWindowChange(self: *Self) void {
+        if (self.pending_automatic_window_change != null) {
+            TRACE(.Debug, "discarding queued window-change before automatic channel allocation", .{});
+            self.pending_automatic_window_change = null;
+        }
     }
 
     pub fn enableAgentForwarding(self: *Self) SshzError!void {
@@ -1989,6 +2020,7 @@ pub const Session = struct {
             return IoError.UnexpectedResponse;
         }
         self.auto_session_enabled = enabled;
+        if (!enabled) self.discardEarlyWindowChange();
     }
 
     pub fn setAutoChannelReadCreditEnabled(self: *Self, enabled: bool) SshzError!void {
@@ -2027,6 +2059,8 @@ pub const Session = struct {
     }
 
     pub fn endSessionRequests(self: *Self) void {
+        self.discardEarlyWindowChange();
+        self.channel_table.discardAllPendingWindowChanges();
         self.endGlobalRequests();
         if (self.auto_exec_ack.channel) |channel_id| self.endAutoExecAck(channel_id);
         self.auto_exec_reply_pending = false;
@@ -2815,6 +2849,7 @@ pub const Session = struct {
                 if (!chan.canReceiveClosePacket()) return IoError.UnexpectedResponse;
                 self.endAutoExecAck(channelnum);
                 chan.close_received = true;
+                self.channel_table.discardPendingWindowChange(chan);
                 chan.discardWriteBuffer();
                 chan.eof_pending = false;
                 if (chan.close_sent) {
@@ -7850,15 +7885,46 @@ test "handlePacket: SSH_MSG_CHANNEL_EXTENDED_DATA surfaces stderr" {
     }
 }
 
-test "sendWindowChange queues pending change" {
+fn automaticWindowChangeChannelForTest(client: *SshzClient, remote_id: u32) !*Channel {
+    const chan = try client.session.allocateClientSessionChannel(.AutoShell);
+    client.session.automatic_session_channel_id = chan.local_id;
+    chan.remote_id = remote_id;
+    chan.remote_id_known = true;
+    chan.peer_window = 32768;
+    chan.remote_max_packet_size = 32768;
+    chan.state = .DataRx;
+    return chan;
+}
+
+fn expectWindowChangeForTest(client: *SshzClient, remote_id: u32, size: [4]u32) !void {
+    var reader = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try reader.readU8());
+    try std.testing.expectEqual(remote_id, try reader.readU32());
+    try std.testing.expectEqualStrings("window-change", try reader.readU32LenString());
+    try std.testing.expect(!try reader.readBoolean());
+    for (size) |dimension| try std.testing.expectEqual(dimension, try reader.readU32());
+    try std.testing.expectEqual(reader.payload.len, reader.off);
+}
+
+test "empty resize flush returns before inspecting transport or channel storage" {
+    comptime {
+        var client: SshzClient = undefined;
+        client.session.channel_table.pending_window_change_count = 0;
+        std.debug.assert(!(client.session.flushPendingWindowChange(&client) catch unreachable));
+    }
+}
+
+test "sendWindowChange coalesces before automatic allocation" {
     var prng = std.Random.DefaultPrng.init(42);
     var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
     defer session.deinit();
 
-    try std.testing.expect(session.pending_window_change == null);
+    try std.testing.expect(session.pending_automatic_window_change == null);
+    session.sendWindowChange(80, 24, 640, 480);
     session.sendWindowChange(120, 40, 960, 640);
-    try std.testing.expect(session.pending_window_change != null);
-    const wc = session.pending_window_change.?;
+    try std.testing.expect(!session.channel_table.hasPendingWindowChanges());
+    try std.testing.expect(session.pending_automatic_window_change != null);
+    const wc = session.pending_automatic_window_change.?;
     try std.testing.expectEqual(@as(u32, 120), wc[0]);
     try std.testing.expectEqual(@as(u32, 40), wc[1]);
     try std.testing.expectEqual(@as(u32, 960), wc[2]);
@@ -7875,17 +7941,17 @@ test "a queued window-change is flushed while the channel sits idle" {
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
-    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
-    chan.state = .DataRx;
+    const chan = try automaticWindowChangeChannelForTest(&m, 7);
     m.session.sessionState = .ChannelActive;
     m.iostate_wr = .Idle;
 
     m.session.sendWindowChange(120, 40, 960, 640);
     // Queued only: sending is the transport's job, at a point where it is safe.
-    try std.testing.expect(m.session.pending_window_change != null);
+    try std.testing.expect(chan.pending_window_change != null);
 
     try std.testing.expect(try m.session.flushPendingWindowChange(&m));
-    try std.testing.expect(m.session.pending_window_change == null);
+    try std.testing.expect(chan.pending_window_change == null);
+    try expectWindowChangeForTest(&m, 7, .{ 120, 40, 960, 640 });
     try std.testing.expectEqual(ChannelState.DataRx, chan.state);
 }
 
@@ -7897,8 +7963,7 @@ test "a flushed window-change preserves the live session state" {
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
-    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
-    chan.state = .DataRx;
+    _ = try automaticWindowChangeChannelForTest(&m, 7);
     m.session.sessionState = .ChannelActive;
     m.iostate_wr = .Idle;
     m.session.setIoSessionState(.ReadPktHdr);
@@ -7921,8 +7986,7 @@ test "window-change completion delivers a concurrently completed body exactly on
     var random = std.Random.DefaultPrng.init(82);
     var client = try keepaliveTestClient(random.random());
     defer client.deinit();
-    const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
-    channel.state = .DataRx;
+    const channel = try automaticWindowChangeChannelForTest(&client, 42);
     _ = try client.getNextEvent();
     var storage: [64]u8 = undefined;
     var payload = BufferWriter.init(&storage, 0);
@@ -7951,8 +8015,7 @@ test "window-change completion flushes queued EOF and CLOSE without inbound traf
         var random = std.Random.DefaultPrng.init(83);
         var client = try keepaliveTestClient(random.random());
         defer client.deinit();
-        const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
-        channel.state = .DataRx;
+        const channel = try automaticWindowChangeChannelForTest(&client, 42);
         const id = channel.local_id;
         _ = try client.getNextEvent();
         client.session.sendWindowChange(100, 30, 800, 480);
@@ -7975,8 +8038,7 @@ test "resize completion handles a received close before queued resize and EOF" {
     var random = std.Random.DefaultPrng.init(84);
     var client = try keepaliveTestClient(random.random());
     defer client.deinit();
-    const channel = client.session.channel_table.allocChannel(42, 32768, 32768).?;
-    channel.state = .DataRx;
+    const channel = try automaticWindowChangeChannelForTest(&client, 42);
     const id = channel.local_id;
     _ = try client.getNextEvent();
     client.session.sendWindowChange(100, 30, 800, 480);
@@ -7984,6 +8046,7 @@ test "resize completion handles a received close before queued resize and EOF" {
     try client.consumed(1);
     try client.sendChannelEof(id);
     client.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
     var payload: [5]u8 = undefined;
     payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
     std.mem.writeInt(u32, payload[1..5], id, .big);
@@ -7994,6 +8057,7 @@ test "resize completion handles a received close before queued resize and EOF" {
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), unencryptedPayload(close)[0]);
     try client.consumed(close.len);
     try std.testing.expectEqual(id, (try client.getNextEvent()).Event.ChannelClosed);
+    try std.testing.expect(!client.session.channel_table.hasPendingWindowChanges());
 }
 
 test "a window-change waits for the write side to be free" {
@@ -8003,14 +8067,13 @@ test "a window-change waits for the write side to be free" {
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
-    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
-    chan.state = .DataRx;
+    const chan = try automaticWindowChangeChannelForTest(&m, 7);
     m.session.sessionState = .ChannelActive;
     m.iostate_wr = .{ .Active = .{ .action = .{ .Producing = 16 }, .next_state = .Idle } };
 
     m.session.sendWindowChange(120, 40, 960, 640);
     try std.testing.expect(!try m.session.flushPendingWindowChange(&m));
-    try std.testing.expect(m.session.pending_window_change != null);
+    try std.testing.expect(chan.pending_window_change != null);
 }
 
 test "a window-change is not dispatched onto a closing channel" {
@@ -8020,15 +8083,16 @@ test "a window-change is not dispatched onto a closing channel" {
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
-    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
-    chan.state = .DataRx;
+    const chan = try automaticWindowChangeChannelForTest(&m, 7);
+    m.session.sendWindowChange(100, 30, 800, 480);
     chan.close_received = true;
     m.session.sessionState = .ChannelActive;
     m.iostate_wr = .Idle;
 
     m.session.sendWindowChange(120, 40, 960, 640);
-    _ = try m.session.flushPendingWindowChange(&m);
-    try std.testing.expect(m.session.pending_window_change != null);
+    try std.testing.expect(!try m.session.flushPendingWindowChange(&m));
+    try std.testing.expect(chan.pending_window_change == null);
+    try std.testing.expect(m.iostate_wr == .Idle);
 }
 
 test "a window-change waits for a session channel to exist" {
@@ -8045,7 +8109,384 @@ test "a window-change waits for a session channel to exist" {
 
     m.session.sendWindowChange(120, 40, 960, 640);
     _ = try m.session.flushPendingWindowChange(&m);
-    try std.testing.expect(m.session.pending_window_change != null);
+    try std.testing.expect(m.session.pending_automatic_window_change != null);
+}
+
+test "automatic resize never selects a lower-slot tunnel or an unrelated manual session" {
+    var random = std.Random.DefaultPrng.init(85);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const tunnel = client.session.channel_table.allocChannel(100, 32768, 32768).?;
+    tunnel.channel_type = .DirectTcpip;
+    tunnel.state = .DataRx;
+    const manual = client.session.channel_table.allocChannel(150, 32768, 32768).?;
+    manual.state = .DataRx;
+    client.session.sendWindowChange(90, 25, 720, 400);
+    try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+    try std.testing.expect(tunnel.pending_window_change == null);
+    try std.testing.expect(manual.pending_window_change == null);
+
+    // Use the real allocation path so the preallocation resize is transferred.
+    client.session.setSessionState(.ChannelOpenReq);
+    try client.session.advanceSession(&client);
+    const automatic = client.session.channel_table.findByLocalId(client.automaticSessionChannelId().?).?;
+    automatic.remote_id = 200;
+    automatic.remote_id_known = true;
+    automatic.state = .DataRx;
+    client.session.active_channel_id = tunnel.local_id;
+    client.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(try client.session.flushPendingWindowChange(&client));
+    try expectWindowChangeForTest(&client, 200, .{ 120, 40, 960, 640 });
+    try std.testing.expectEqual(tunnel.local_id, client.session.active_channel_id.?);
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    try std.testing.expect(tunnel.pending_window_change == null);
+    try std.testing.expect(manual.pending_window_change == null);
+}
+
+fn confirmWindowChangeSessionForTest(client: *SshzClient, id: u32, remote_id: u32) !void {
+    try consumeKeepaliveTestPacket(client);
+    var storage: [32]u8 = undefined;
+    var payload = BufferWriter.init(&storage, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try payload.writeU32(id);
+    try payload.writeU32(remote_id);
+    try payload.writeU32(32768);
+    try payload.writeU32(4096);
+    try feedKeepaliveTestPayload(client, payload.active());
+    try std.testing.expectEqual(id, (try client.getNextEvent()).Event.ChannelOpened);
+    try client.clearEvent(.{ .ChannelOpened = id });
+}
+
+test "explicit resize API opens two sessions and fairly coalesces each remote target" {
+    var random = std.Random.DefaultPrng.init(86);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try client.setAutoSessionEnabled(false);
+    client.session.user_authenticated = true;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+
+    const first = try client.openSessionChannel();
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(first, 80, 24, 0, 0));
+    try confirmWindowChangeSessionForTest(&client, first, 101);
+    const second = try client.openSessionChannel();
+    try confirmWindowChangeSessionForTest(&client, second, 202);
+    const first_chan = client.session.channel_table.findByLocalId(first).?;
+    const second_chan = client.session.channel_table.findByLocalId(second).?;
+    const read_before = client.iostate_rd;
+    const active_before = client.session.active_channel_id;
+    try client.sendChannelWindowChange(first, 80, 24, 0, 0);
+    try client.sendChannelWindowChange(second, 90, 25, 720, 400);
+    try client.sendChannelWindowChange(first, 100, 30, 800, 480);
+    try client.sendChannelWindowChange(second, 120, 40, 960, 640);
+    try std.testing.expectEqual(@as(u8, 2), client.session.channel_table.pending_window_change_count);
+    try std.testing.expectEqualDeep(read_before, client.iostate_rd);
+    try std.testing.expectEqual(active_before, client.session.active_channel_id);
+    try std.testing.expect(client.iostate_wr == .Idle);
+    client.session.channel_table.last_window_change_slot = 0;
+    try client.advance();
+    try expectWindowChangeForTest(&client, 202, .{ 120, 40, 960, 640 });
+    try std.testing.expectEqualDeep(@as(?[4]u32, .{ 100, 30, 800, 480 }), first_chan.pending_window_change);
+    try std.testing.expect(second_chan.pending_window_change == null);
+    try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
+
+    // Repeated updates on the just-serviced channel cannot starve its peer.
+    try client.sendChannelWindowChange(second, 130, 45, 1040, 720);
+    try std.testing.expectEqual(@as(u8, 2), client.session.channel_table.pending_window_change_count);
+    client.session.channel_table.last_serviced_slot = 0;
+    try consumeKeepaliveTestPacket(&client);
+    try expectWindowChangeForTest(&client, 101, .{ 100, 30, 800, 480 });
+    try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
+    try consumeKeepaliveTestPacket(&client);
+    try expectWindowChangeForTest(&client, 202, .{ 130, 45, 1040, 720 });
+    try std.testing.expect(!client.session.channel_table.hasPendingWindowChanges());
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(first_chan.pending_window_change == null);
+    try std.testing.expect(second_chan.pending_window_change == null);
+    try std.testing.expectEqualDeep(read_before, client.iostate_rd);
+    try std.testing.expectEqual(active_before, client.session.active_channel_id);
+}
+
+test "explicit resize rejects invalid targets without changing any pending size" {
+    var random = std.Random.DefaultPrng.init(87);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const valid = client.session.channel_table.allocChannel(100, 32768, 32768).?;
+    valid.state = .DataRx;
+    const candidate = client.session.channel_table.allocChannel(200, 32768, 32768).?;
+    try client.sendChannelWindowChange(valid.local_id, 120, 40, 960, 640);
+    const expected: ?[4]u32 = .{ 120, 40, 960, 640 };
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(9999, 1, 2, 3, 4));
+    for ([_]ChannelState{ .OpenWrite, .OpenSent, .Open, .OpenPending, .ConfirmWrite, .RspWrite, .RspFailureWrite, .CloseWrite, .Closed, .OpenFailureWrite }) |state| {
+        candidate.state = state;
+        client.session.channel_table.queueWindowChange(candidate, .{ 80, 24, 0, 0 });
+        try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(candidate.local_id, 1, 2, 3, 4));
+        try std.testing.expectEqualDeep(expected, valid.pending_window_change);
+        try std.testing.expectEqualDeep(@as(?[4]u32, .{ 80, 24, 0, 0 }), candidate.pending_window_change);
+    }
+    candidate.state = .DataRx;
+    for (std.meta.tags(enum { UnknownRemote, DirectTcpip, ForwardedTcpip, Agent, ClosePending, CloseSent, CloseReceived })) |case| {
+        candidate.remote_id_known = case != .UnknownRemote;
+        candidate.channel_type = switch (case) {
+            .DirectTcpip => .DirectTcpip,
+            .ForwardedTcpip => .ForwardedTcpip,
+            else => .Session,
+        };
+        candidate.kind = if (case == .Agent) .AgentForward else .Session;
+        candidate.close_pending = case == .ClosePending;
+        candidate.close_sent = case == .CloseSent;
+        candidate.close_received = case == .CloseReceived;
+        try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(candidate.local_id, 1, 2, 3, 4));
+        try std.testing.expectEqualDeep(expected, valid.pending_window_change);
+        try std.testing.expectEqualDeep(@as(?[4]u32, .{ 80, 24, 0, 0 }), candidate.pending_window_change);
+    }
+    client.terminated = true;
+    try std.testing.expectError(IoError.SessionTerminated, client.sendChannelWindowChange(valid.local_id, 1, 2, 3, 4));
+    try std.testing.expectEqualDeep(expected, valid.pending_window_change);
+    client.terminated = false;
+    var server = try Sshz.SshzServer.init(random.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer server.deinit();
+    try std.testing.expectError(IoError.UnimplementedService, server.sendChannelWindowChange(0, 1, 2, 3, 4));
+}
+
+test "automatic resize coalesces across real shell and exec allocation and setup" {
+    for ([_]bool{ false, true }) |exec| {
+        var random = std.Random.DefaultPrng.init(88);
+        var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+        defer client.deinit();
+        if (exec) try client.setAutoExecCommand("true");
+        client.session.sendWindowChange(80, 24, 0, 0);
+        client.session.sendWindowChange(90, 25, 720, 400);
+        try std.testing.expect(!client.session.channel_table.hasPendingWindowChanges());
+        const id = try openAutomaticExecForTest(&client);
+        const channel = client.session.channel_table.findByLocalId(id).?;
+        try std.testing.expect(client.session.pending_automatic_window_change == null);
+        try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
+        try std.testing.expectEqualDeep(@as(?[4]u32, .{ 90, 25, 720, 400 }), channel.pending_window_change);
+        client.session.sendWindowChange(100, 30, 800, 480);
+        if (!exec) {
+            try expectProducedChannelRequest(&client, "pty-req");
+            try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(id, 1, 2, 3, 4));
+            try consumeKeepaliveTestPacket(&client);
+            try expectProducedChannelRequest(&client, "shell");
+        } else {
+            try expectProducedExecRequest(&client, "true");
+        }
+        // Setup has been framed but is still in flight. Both APIs now use the
+        // same channel slot; the old preallocation size must not return.
+        client.session.sendWindowChange(110, 35, 880, 560);
+        try client.sendChannelWindowChange(id, 120, 40, 960, 640);
+        try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
+        try consumeKeepaliveTestPacket(&client);
+        try expectWindowChangeForTest(&client, 42, .{ 120, 40, 960, 640 });
+        try std.testing.expect(!client.session.channel_table.hasPendingWindowChanges());
+        try consumeKeepaliveTestPacket(&client);
+        try std.testing.expect((try client.getNextEvent()).Event == .Connected);
+        try client.clearEvent(.Connected);
+        try std.testing.expect(channel.pending_window_change == null);
+    }
+}
+
+test "automatic and explicit resize calls share last-call order without changing framed bytes" {
+    var random = std.Random.DefaultPrng.init(89);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const channel = try automaticWindowChangeChannelForTest(&client, 42);
+    try client.sendChannelWindowChange(channel.local_id, 80, 24, 0, 0);
+    client.session.sendWindowChange(100, 30, 800, 480);
+    try client.advance();
+    try expectWindowChangeForTest(&client, 42, .{ 100, 30, 800, 480 });
+    client.session.sendWindowChange(110, 35, 880, 560);
+    try client.sendChannelWindowChange(channel.local_id, 120, 40, 960, 640);
+    try expectWindowChangeForTest(&client, 42, .{ 100, 30, 800, 480 });
+    try consumeKeepaliveTestPacket(&client);
+    try expectWindowChangeForTest(&client, 42, .{ 120, 40, 960, 640 });
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(channel.pending_window_change == null);
+}
+
+test "automatic setup resize waits without blocking another session and drops rejected work" {
+    var random = std.Random.DefaultPrng.init(90);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const automatic = try automaticWindowChangeChannelForTest(&client, 42);
+    const manual = client.session.channel_table.allocChannel(100, 32768, 32768).?;
+    manual.state = .DataRx;
+    for ([_]ChannelState{ .OpenWrite, .OpenSent, .Open, .RspWrite, .EofWrite }) |state| {
+        automatic.state = state;
+        automatic.remote_id_known = state != .OpenWrite and state != .OpenSent;
+        client.session.sendWindowChange(100, 30, 800, 480);
+        try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+        try std.testing.expect(automatic.pending_window_change != null);
+        if (state == .Open) try std.testing.expect(automatic.canReceiveRequestPacket());
+    }
+    try client.sendChannelWindowChange(manual.local_id, 120, 40, 960, 640);
+    try std.testing.expect(try client.session.flushPendingWindowChange(&client));
+    try expectWindowChangeForTest(&client, 100, .{ 120, 40, 960, 640 });
+    // Avoid pumping the artificial setup fixture; normalize it before write completion.
+    automatic.state = .DataRx;
+    automatic.tx_in_flight_len = 1;
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expect(automatic.pending_window_change != null);
+    automatic.tx_in_flight_len = 0;
+    try client.advance();
+    try expectWindowChangeForTest(&client, 42, .{ 100, 30, 800, 480 });
+    try consumeKeepaliveTestPacket(&client);
+
+    for ([_]ChannelState{ .OpenFailureWrite, .RspFailureWrite, .Closed }) |state| {
+        automatic.state = .DataRx;
+        client.session.sendWindowChange(100, 30, 800, 480);
+        automatic.state = state;
+        try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+        try std.testing.expect(automatic.pending_window_change == null);
+        try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(automatic.local_id, 1, 2, 3, 4));
+    }
+}
+
+test "removed resize targets cannot pass pending work to reused slots or wrapped IDs" {
+    var random = std.Random.DefaultPrng.init(91);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const automatic = try automaticWindowChangeChannelForTest(&client, 42);
+    const id = automatic.local_id;
+    client.session.sendWindowChange(100, 30, 800, 480);
+    client.session.channel_table.freeChannel(id);
+    client.session.sendWindowChange(110, 35, 880, 560);
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(id, 1, 2, 3, 4));
+    const replacement = client.session.channel_table.allocChannel(100, 32768, 32768).?;
+    replacement.state = .DataRx;
+    try std.testing.expect(replacement.local_id != id);
+    try std.testing.expect(replacement.pending_window_change == null);
+    try client.sendChannelWindowChange(replacement.local_id, 120, 40, 960, 640);
+    client.session.sendWindowChange(130, 45, 1040, 720);
+    try std.testing.expect(try client.session.flushPendingWindowChange(&client));
+    try expectWindowChangeForTest(&client, 100, .{ 120, 40, 960, 640 });
+    try consumeKeepaliveTestPacket(&client);
+
+    const replacement_id = replacement.local_id;
+    try client.sendChannelWindowChange(replacement_id, 140, 50, 1120, 800);
+    client.session.channel_table.freeChannel(replacement_id);
+    client.session.channel_table.next_local_id = id;
+    const wrapped = client.session.channel_table.allocChannel(200, 32768, 32768).?;
+    wrapped.state = .DataRx;
+    try std.testing.expectEqual(id, wrapped.local_id);
+    client.session.sendWindowChange(150, 55, 1200, 880);
+    try std.testing.expect(wrapped.pending_window_change == null);
+    try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+    try std.testing.expect(client.iostate_wr == .Idle);
+}
+
+test "real inbound rejection and failed outbound open cannot become resize targets" {
+    var random = std.Random.DefaultPrng.init(92);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    client.session.sendWindowChange(100, 30, 800, 480);
+    const rejected = try rejectClientForwardedOpenDuringRekeyForTest(&client);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(rejected, 1, 2, 3, 4));
+    client.session.sendWindowChange(120, 40, 960, 640);
+    client.session.is_rekeying = false;
+    client.session.rekey_resume_state = null;
+    client.iostate_rd = .Idle;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.Idle);
+    try client.advance();
+    var reader = BufferReader.init(unencryptedPayload(try client.peek(Protocol.MaxSSHPacket)));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try reader.readU8());
+    try std.testing.expectEqual(@as(u32, 90), try reader.readU32());
+    try std.testing.expect(client.session.pending_automatic_window_change != null);
+    try consumeKeepaliveTestPacket(&client);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(rejected, 1, 2, 3, 4));
+
+    const outbound = try client.openSessionChannel();
+    try consumeKeepaliveTestPacket(&client);
+    var storage: [64]u8 = undefined;
+    var failure = BufferWriter.init(&storage, 0);
+    try failure.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+    try failure.writeU32(outbound);
+    try failure.writeU32(SshOpenFailureReason.AdministrativelyProhibited);
+    try failure.writeU32LenString("denied");
+    try failure.writeU32LenString("");
+    try feedKeepaliveTestPayload(&client, failure.active());
+    try std.testing.expectError(IoError.UnexpectedResponse, client.sendChannelWindowChange(outbound, 1, 2, 3, 4));
+    try std.testing.expect(client.session.pending_automatic_window_change != null);
+}
+
+test "resize queues respect reply read-completion and rekey gates without mutation" {
+    var random = std.Random.DefaultPrng.init(93);
+    var client = try keepaliveTestClient(random.random());
+    defer client.deinit();
+    const channel = try automaticWindowChangeChannelForTest(&client, 42);
+    for (std.meta.tags(enum { Reply, ReadCompletion, Rekey, LocalRekey, InFlightData })) |gate| {
+        client.session.pending_channel_replies_len = if (gate == .Reply) 1 else 0;
+        client.session.setIoSessionState(if (gate == .ReadCompletion) .{ .ReadPktCompletion = &.{} } else .ReadPktHdr);
+        client.session.is_rekeying = gate == .Rekey;
+        client.local_rekey_pending = gate == .LocalRekey;
+        channel.tx_in_flight_len = if (gate == .InFlightData) 1 else 0;
+        client.session.sendWindowChange(100, 30, 800, 480);
+        try client.sendChannelWindowChange(channel.local_id, 120, 40, 960, 640);
+        const io_before = client.session.ioSessionState;
+        const active_before = client.session.active_channel_id;
+        try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+        try std.testing.expectEqualDeep(@as(?[4]u32, .{ 120, 40, 960, 640 }), channel.pending_window_change);
+        try std.testing.expectEqualDeep(io_before, client.session.ioSessionState);
+        try std.testing.expectEqual(active_before, client.session.active_channel_id);
+        try std.testing.expect(client.iostate_wr == .Idle);
+    }
+    channel.tx_in_flight_len = 0;
+    channel.state = .EofWrite;
+    try client.sendChannelWindowChange(channel.local_id, 130, 45, 1040, 720);
+    try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+    try std.testing.expect(channel.pending_window_change != null);
+    channel.state = .DataRx;
+    channel.eof_pending = true;
+    channel.eof_sent = true;
+    channel.eof_received = true;
+    try std.testing.expect(try client.session.flushPendingWindowChange(&client));
+    try expectWindowChangeForTest(&client, 42, .{ 130, 45, 1040, 720 });
+}
+
+test "resize summary clears on local close session end and fail-closed reset" {
+    for (std.meta.tags(enum { LocalClose, SessionEnd, FailClosed })) |action| {
+        var random = std.Random.DefaultPrng.init(95);
+        var client = try keepaliveTestClient(random.random());
+        defer client.deinit();
+        const automatic = try automaticWindowChangeChannelForTest(&client, 42);
+        const manual = client.session.channel_table.allocChannel(100, 32768, 32768).?;
+        manual.state = .DataRx;
+        client.session.sendWindowChange(100, 30, 800, 480);
+        try client.sendChannelWindowChange(manual.local_id, 120, 40, 960, 640);
+        try std.testing.expectEqual(@as(u8, 2), client.session.channel_table.pending_window_change_count);
+        switch (action) {
+            .LocalClose => {
+                try client.session.sendChannelClose(automatic.local_id, &client);
+                try std.testing.expectEqual(@as(u8, 1), client.session.channel_table.pending_window_change_count);
+                try client.session.sendChannelClose(manual.local_id, &client);
+            },
+            .SessionEnd => client.session.endSessionRequests(),
+            .FailClosed => client.session.failClosed(),
+        }
+        try std.testing.expect(!client.session.channel_table.hasPendingWindowChanges());
+        try std.testing.expect(!try client.session.flushPendingWindowChange(&client));
+    }
+}
+
+test "disabling or ending automatic sessions discards obsolete resize queues" {
+    var random = std.Random.DefaultPrng.init(94);
+    var client = try SshzClient.init(random.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    client.session.sendWindowChange(100, 30, 800, 480);
+    try client.setAutoSessionEnabled(false);
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    client.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    try client.setAutoSessionEnabled(true);
+    client.session.sendWindowChange(100, 30, 800, 480);
+    client.session.endSessionRequests();
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    client.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(client.session.pending_automatic_window_change == null);
+    try std.testing.expectError(IoError.SessionTerminated, client.sendChannelWindowChange(0, 1, 2, 3, 4));
 }
 
 test "handlePacket: SSH_MSG_USERAUTH_INFO_REQUEST surfaces keyboard-interactive prompt" {

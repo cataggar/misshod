@@ -1957,6 +1957,23 @@ pub fn SshzImpl(role: Role) type {
             };
         }
 
+        /// Queues the latest terminal size for an established client session
+        /// channel. Each channel has one bounded coalescing slot; this does not
+        /// request a PTY or wait for a peer reply. Continue pumping advance().
+        ///
+        /// Unknown, opening/setup, non-session, rejected and closing/closed
+        /// targets return UnexpectedResponse without modifying any queue.
+        /// Terminated sessions return SessionTerminated; server unsupported.
+        /// An established channel's EOF write may defer sending, not queuing.
+        /// For early automatic shell/exec resizing use session.sendWindowChange.
+        pub fn sendChannelWindowChange(self: *Self, channel_id: u32, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            return switch (role) {
+                .Client => self.session.sendChannelWindowChange(channel_id, cols, rows, width_px, height_px),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         /// Returns the automatic session channel ID once it has been allocated.
         ///
         /// The ID remains available after channel close and `EndSession`.

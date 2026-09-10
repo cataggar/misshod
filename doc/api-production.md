@@ -156,6 +156,50 @@ The production client example tests this operation through its real pump
 with partial encrypted writes, exhausted peer credit, and a complete rekey.
 The peer receives only the preserved prefix and subsequently accepted data.
 
+### Terminal resize requests
+
+There are two client resize APIs; neither requests a PTY or a peer reply:
+
+- `client.session.sendWindowChange(cols, rows, width_px, height_px)` retains
+  its `void` signature and targets **only** the automatic shell/exec channel
+  reported by `automaticSessionChannelId()`, never a manual session, tunnel,
+  or agent channel. Calls before automatic channel allocation coalesce in one
+  early slot. That slot is transferred once at allocation, and sending waits
+  for open confirmation and automatic PTY/shell/exec setup to be framed.
+- `try client.sendChannelWindowChange(channel_id, cols, rows, width_px,
+  height_px)` explicitly targets an established SSH `"session"` channel,
+  including a manually opened session. Wait for its `ChannelOpened` event
+  (or locally completed automatic setup). Unknown IDs, unconfirmed opens,
+  setup/decision/rejection states, tunnels, agent channels, and closing/closed
+  channels return `UnexpectedResponse` **without modifying any queue**.
+  Terminated clients return `SessionTerminated`; the server role returns
+  `UnimplementedService`. This API does not add manual PTY setup.
+
+Each channel owns one pending size; later calls replace only that channel's
+unframed size. Both APIs share the same slot once the automatic channel exists,
+so the latest call wins regardless of API. A resize already framed for the
+transport cannot be changed or cancelled; later updates coalesce behind it.
+Independent channel sizes cannot overwrite one another. There is no extra
+allocation or queue-full condition: storage is bounded by channel capacity,
+plus the single early automatic slot.
+
+Both APIs only queue. Continue driving `advance()` and the transport pump.
+Eligible channels are serviced round-robin, even on quiet connections with a
+read outstanding. A setup/write-blocked channel does not block another's
+resize. Pending channel replies, an occupied write side, receive completion,
+and local/peer rekey retain their existing priority and gates. EOF alone does
+not end the request direction: explicit queuing remains valid during an
+established channel's EOF write, but that write must finish before sending
+the resize.
+
+Close, rejection, channel removal, and session end discard obsolete queued
+work with metadata-only debug tracing. Disabling automatic sessions discards
+the early automatic size; convenience calls while disabled, ended, or after
+the automatic channel closes are similarly traced and ignored. A queued size
+never follows a reused channel slot or a wrapped local ID to another channel.
+The convenience API no longer implicitly resizes a manually opened session;
+use the explicit API for that target.
+
 ## Client event loop and host identity
 
 `CheckHostKey` is a mandatory trust decision emitted after the key-exchange
