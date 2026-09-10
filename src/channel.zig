@@ -1,6 +1,7 @@
 const std = @import("std");
 const Protocol = @import("protocol.zig");
 const build_options = @import("sshz_build_options");
+const TRACE = @import("util.zig").trace;
 
 pub const MaxChannels: u8 = build_options.channel_capacity;
 pub const MaxPendingChannelData = MaxChannels * Protocol.MaxChannelDataLen;
@@ -114,6 +115,7 @@ pub const Channel = struct {
     automatic_read_credit: bool,
     delivered_uncredited: u32,
     pending_window_adjust: u32,
+    pending_window_change: ?[4]u32 = null,
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
     tx_in_flight_len: usize,
@@ -180,7 +182,15 @@ pub const Channel = struct {
     }
 
     pub fn secureZero(self: *Self) void {
+        self.discardPendingWindowChange();
         std.crypto.secureZero(u8, &self.write_buf);
+    }
+
+    pub fn discardPendingWindowChange(self: *Self) void {
+        if (self.pending_window_change != null) {
+            TRACE(.Debug, "discarding queued window-change for obsolete channel {d}", .{self.local_id});
+            self.pending_window_change = null;
+        }
     }
 
     pub fn consumeWriteBuffer(self: *Self, sent: usize) void {
@@ -251,6 +261,29 @@ pub const Channel = struct {
 
     pub fn canReceiveWindowAdjustPacket(self: *const Self) bool {
         return self.establishedForReceive() and !self.close_received;
+    }
+
+    /// Outbound requests wait for setup, unlike traffic received after open
+    /// confirmation. EOF alone does not close the channel's request direction.
+    pub fn canSendChannelRequest(self: *const Self) bool {
+        if (!self.remote_id_known or self.close_pending or self.close_sent or self.close_received) return false;
+        return switch (self.state) {
+            .Connected, .Data, .DataRx, .DataTx, .DataTxComplete => true,
+            .OpenWrite, .Open, .OpenSent, .ConfirmWrite, .RspWrite, .RspFailureWrite, .EofWrite, .CloseWrite, .Closed, .OpenFailureWrite => false,
+        };
+    }
+
+    /// A queued automatic resize may survive outbound setup or an EOF write,
+    /// but never rejection, close, or reuse as a non-session channel.
+    pub fn canRetainWindowChange(self: *const Self) bool {
+        if (self.kind != .Session or self.channel_type != .Session or
+            self.close_pending or self.close_sent or self.close_received) return false;
+        if (self.canSendChannelRequest()) return true;
+        return switch (self.state) {
+            .OpenWrite, .OpenSent, .Open, .RspWrite => self.client_open_mode != .RawSession,
+            .EofWrite => self.remote_id_known,
+            else => false,
+        };
     }
 
     pub fn consumeLocalWindow(self: *Self, len: usize) ChannelError!void {
@@ -330,6 +363,7 @@ pub const ChannelTable = struct {
     channels: [MaxChannels]?Channel = .{null} ** MaxChannels,
     next_local_id: u32 = 0,
     last_serviced_slot: usize = 0,
+    last_window_change_slot: usize = 0,
     limits: ChannelLimits = .{},
 
     pub fn allocChannel(self: *Self, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
@@ -378,20 +412,6 @@ pub const ChannelTable = struct {
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {
                 if (ch.local_id == local_id) return ch;
-            }
-        }
-        return null;
-    }
-
-    /// Finds a channel of `kind` regardless of whether it has work pending.
-    ///
-    /// `findNextRunnable` deliberately skips an idle channel, so it cannot be
-    /// used to deliver something *to* one — a session waiting in `.DataRx` is
-    /// exactly the case that needs to be woken for an out-of-band request.
-    pub fn findByKind(self: *Self, kind: ChannelKind) ?*Channel {
-        for (&self.channels) |*slot| {
-            if (slot.*) |*ch| {
-                if (ch.kind == kind) return ch;
             }
         }
         return null;
@@ -509,9 +529,76 @@ pub const ChannelTable = struct {
         }
         return null;
     }
+
+    /// Resize fairness is independent of the data/control scheduler's cursor.
+    /// A channel waiting for setup or a write cannot block another's resize.
+    pub fn findNextWindowChange(self: *Self) ?*Channel {
+        for (0..MaxChannels) |i| {
+            const slot_idx = (self.last_window_change_slot + 1 + i) % MaxChannels;
+            if (self.channels[slot_idx]) |*ch| {
+                if (ch.pending_window_change == null) continue;
+                if (!ch.canRetainWindowChange()) {
+                    ch.discardPendingWindowChange();
+                    continue;
+                }
+                if (ch.canSendChannelRequest() and ch.tx_in_flight_len == 0) {
+                    self.last_window_change_slot = slot_idx;
+                    return ch;
+                }
+            }
+        }
+        return null;
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "outbound channel requests wait for setup without restricting confirmed receive" {
+    var channel = Channel.init(0, 42, 32768, 32768);
+    channel.client_open_mode = .AutoShell;
+    inline for (std.meta.tags(ChannelState)) |state| {
+        channel.state = state;
+        const ready = switch (state) {
+            .Connected, .Data, .DataRx, .DataTx, .DataTxComplete => true,
+            else => false,
+        };
+        try std.testing.expectEqual(ready, channel.canSendChannelRequest());
+        channel.remote_id_known = false;
+        try std.testing.expect(!channel.canSendChannelRequest());
+        channel.remote_id_known = true;
+    }
+    channel.state = .Open;
+    try std.testing.expect(channel.canReceiveRequestPacket());
+    try std.testing.expect(!channel.canSendChannelRequest());
+    try std.testing.expect(channel.canRetainWindowChange());
+    channel.state = .DataRx;
+    inline for (.{ "close_pending", "close_sent", "close_received" }) |field| {
+        @field(channel, field) = true;
+        try std.testing.expect(!channel.canSendChannelRequest());
+        try std.testing.expect(!channel.canRetainWindowChange());
+        @field(channel, field) = false;
+    }
+    channel.eof_sent = true;
+    channel.eof_received = true;
+    try std.testing.expect(channel.canSendChannelRequest());
+}
+
+test "pending resize storage follows channel capacity and resets on slot release" {
+    var table = ChannelTable{ .limits = .{ .max_channels = 2 } };
+    for (0..2) |index| {
+        const channel = table.allocChannel(@intCast(100 + index), 32768, 32768).?;
+        channel.state = .DataRx;
+        channel.pending_window_change = .{ 80, 24, 0, 0 };
+    }
+    try std.testing.expect(table.allocChannel(300, 32768, 32768) == null);
+    const channel = table.findByLocalId(0).?;
+    channel.pending_window_change = .{ 120, 40, 960, 640 };
+    try std.testing.expectEqualDeep(@as(?[4]u32, .{ 80, 24, 0, 0 }), table.findByLocalId(1).?.pending_window_change);
+    table.freeChannel(0);
+    const replacement = table.allocChannel(300, 32768, 32768).?;
+    try std.testing.expect(replacement.pending_window_change == null);
+    try std.testing.expectEqual(@as(u32, 1), table.findNextWindowChange().?.local_id);
+}
 
 test "allocChannel assigns monotonic local IDs" {
     var table = ChannelTable{};

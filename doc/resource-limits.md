@@ -31,6 +31,7 @@ control.
 | automatic rekey after encrypted packets, per direction/key epoch | 1,073,741,824 |
 | automatic rekey after key age | disabled until configured in caller clock ticks |
 | outstanding global requests | 1 |
+| pending client terminal sizes | 1 per channel, plus 1 before automatic allocation |
 | decompressed packet payload | 34,708 bytes |
 | retained server exit submissions | configured channel count |
 | submitted exit-signal name / message / language tag | 64 / 1,024 / 64 bytes |
@@ -60,6 +61,24 @@ storage even when fewer channels are active. Each channel slot includes a
 `channel_capacity * 34,653`, and client/server exit-result and pending-reply tables
 also scale with the capacity. Embedders should account for this linear growth
 when deciding whether to place session values on the stack or heap.
+
+Each compiled channel slot also includes an optional four-`u32` terminal size.
+The client coalesces resize updates independently per session channel; it
+does not allocate a request queue or charge these sizes against buffered
+channel data. At most `max_channels` channel sizes can be pending, plus one
+client-only early automatic size before the automatic channel is allocated.
+Allocation transfers and clears that early slot. Both resize APIs then share
+the automatic channel's single slot, with latest-call-wins ordering.
+An already-framed resize remains in the ordinary single transport write
+buffer; it is not replaced by a later update.
+
+Ready resize targets are scanned round-robin with a separate bounded cursor,
+so setup or in-flight data on one channel does not starve another channel's
+size. Close/rejection/removal clears obsolete sizes with metadata-only debug
+tracing, and slot reuse never inherits them. See
+[terminal resize requests](api-production.md#terminal-resize-requests)
+for explicit-target validation, automatic preallocation behavior, and the
+existing transport/rekey gates.
 
 ## Application-controlled receive credit
 
