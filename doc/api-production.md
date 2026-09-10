@@ -31,6 +31,12 @@ or errors require at least a minor version; fixes that preserve the contract
 may be patches. Zig compiler-version changes are compatibility changes and
 must be stated in release notes.
 
+**Server event migration:** exhaustive `SshzServerEventCodes` switches must
+handle `PtyRequest` and `ChannelEof`, even when their runtime observation
+remains disabled. Reject unexpected PTY requests with `rejectPtyRequest`,
+not generic `clearEvent`; clear received EOF with `clearEvent`. Unchanged
+runtime defaults do not promise source compatibility for exhaustive switches.
+
 Everything reached through `.session`, public implementation fields, the
 `client_session.zig`, `server_session.zig`, `channel.zig`, and `protocol.zig`
 modules, packet inspection/exercise helpers, and `requestRead`,

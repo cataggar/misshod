@@ -229,6 +229,7 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.assert(false);
                         },
                         .ChannelRequest,
+                        .ChannelEof,
                         .WindowChange,
                         .Signal,
                         .RxExtendedData,
@@ -238,6 +239,9 @@ pub fn main(init: std.process.Init) !void {
                         .AgentChannelClosed,
                         => {
                             try sshz.clearEvent(eventCode);
+                        },
+                        .PtyRequest => |request| {
+                            try sshz.rejectPtyRequest(request.channel);
                         },
                         .ChannelOpenRequest => |request| {
                             switch (request.request) {
