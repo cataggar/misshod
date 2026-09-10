@@ -10,6 +10,13 @@ pub const BufferError = @import("buffer.zig").BufferError;
 pub const BufferReader = @import("buffer.zig").BufferReader;
 pub const BufferWriter = @import("buffer.zig").BufferWriter;
 
+/// The version this build reports, from `-Dversion`. A release build feeds
+/// it from the tag; otherwise it is the version declared in `build.zig.zon`.
+///
+/// Named to keep it distinct from the SSH identification strings this file
+/// also calls a version.
+pub const library_version = util.version;
+
 /// Reading and matching OpenSSH's `known_hosts`, so that an embedder deciding
 /// `CheckHostKey` does not have to reimplement the format. Does no I/O.
 pub const known_hosts = @import("known_hosts.zig");
