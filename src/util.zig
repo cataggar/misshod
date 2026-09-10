@@ -31,6 +31,14 @@ const trace_level: TraceLevel = blk: {
 
 pub const unsafe_secret_tracing = build_options.unsafe_secret_tracing;
 
+/// The version this build reports.
+///
+/// Set by `-Dversion`, which a release build feeds from the tag, so a
+/// tagged artifact stamps its own tag rather than whatever was last
+/// committed. Untagged builds fall back to the version declared in
+/// `build.zig.zon`.
+pub const version = build_options.version;
+
 /// Whether any call site can reach `std.debug.print`.
 ///
 /// Exposed so a build can assert that the default one stays silent.

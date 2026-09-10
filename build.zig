@@ -39,6 +39,14 @@ pub const TraceLevel = enum { off, info, debug };
 const default_trace_level: TraceLevel = .off;
 const default_channel_capacity: u8 = 4;
 
+/// What `-Dversion` reports when nobody passes one.
+///
+/// The tag is the source of truth for a release: a tagged build passes
+/// `-Dversion=${GITHUB_REF_NAME#v}` and stamps its own tag. This fallback
+/// tracks the version declared in `build.zig.zon` so an untagged build
+/// still reports something truthful.
+const default_version = "0.2.0";
+
 /// Emitted as a name rather than the enum itself so `util.zig` keeps one
 /// definition of the level and maps onto it explicitly.
 fn addTraceLevel(options: *std.Build.Step.Options, level: TraceLevel) void {
@@ -50,10 +58,12 @@ fn addSshzOptions(
     unsafe_secret_tracing: bool,
     trace_level: TraceLevel,
     channel_capacity: u8,
+    version: []const u8,
 ) void {
     options.addOption(bool, "unsafe_secret_tracing", unsafe_secret_tracing);
     addTraceLevel(options, trace_level);
     options.addOption(u8, "channel_capacity", channel_capacity);
+    options.addOption([]const u8, "version", version);
 }
 
 pub fn build(b: *std.Build) void {
@@ -78,8 +88,13 @@ pub fn build(b: *std.Build) void {
         "channel_capacity",
         "Compile-time channel-table capacity (default: 4)",
     ) orelse default_channel_capacity;
+    const version = b.option(
+        []const u8,
+        "version",
+        "Version string reported by the library (release builds pass the tag)",
+    ) orelse default_version;
     const options = b.addOptions();
-    addSshzOptions(options, unsafe_secret_tracing, trace_level, channel_capacity);
+    addSshzOptions(options, unsafe_secret_tracing, trace_level, channel_capacity, version);
 
     const mod = b.addModule("sshz", .{
         .root_source_file = b.path("src/sshz.zig"),
@@ -106,7 +121,7 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const safe_trace_options = b.addOptions();
-    addSshzOptions(safe_trace_options, false, trace_level, channel_capacity);
+    addSshzOptions(safe_trace_options, false, trace_level, channel_capacity, version);
     const safe_trace_test_mod = b.createModule(.{
         .root_source_file = b.path("src/trace_gate_test.zig"),
         .target = target,
@@ -123,7 +138,7 @@ pub fn build(b: *std.Build) void {
     // was given, so `zig build test -Dtrace=info` does not silently excuse
     // the default from staying quiet.
     const default_trace_options = b.addOptions();
-    addSshzOptions(default_trace_options, false, default_trace_level, default_channel_capacity);
+    addSshzOptions(default_trace_options, false, default_trace_level, default_channel_capacity, version);
     const trace_off_test_mod = b.createModule(.{
         .root_source_file = b.path("src/trace_off_test.zig"),
         .target = target,
@@ -137,7 +152,7 @@ pub fn build(b: *std.Build) void {
     const run_trace_off_tests = b.addRunArtifact(trace_off_tests);
 
     const configured_capacity_options = b.addOptions();
-    addSshzOptions(configured_capacity_options, false, default_trace_level, 8);
+    addSshzOptions(configured_capacity_options, false, default_trace_level, 8, version);
     const configured_capacity_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),
         .target = target,
