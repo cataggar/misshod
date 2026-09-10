@@ -22,7 +22,8 @@ The candidate production-facing surface is the `sshz` module's
 `ResourceLimits`, deadline/key-lifetime types, `SshOpenFailureReason`,
 `KeepaliveToken`, `KeepaliveStatus`, `KeepaliveTransmission`,
 `KeepaliveOutcome`, `KeepaliveReply`, `AutoExecAckStatus`, `AutoExecAckOutcome`,
-`AutoExecTransmission`, `SshzError`, and buffer helper types.
+`AutoExecTransmission`, `PtyRequest`, `ServerChannelExitStatus`,
+`ServerChannelExitTransmission`, `SshzError`, and buffer helper types.
 After API version 1, these names,
 their documented semantics, and default resource limits follow semantic
 versioning: source-breaking changes require a major version; additive events
@@ -404,12 +405,12 @@ by connection cleanup, not acceptance or an indefinite pending event.
    release blocker for applications needing request-level rejection.
    Session-specific requests are rejected at the protocol boundary when their
    recipient is not a `Session` channel and never reach application callbacks.
-4. Process `RxData`/`RxExtendedData` synchronously and clear the event to
-   release the borrowed payload. Automatic receive-window replenishment remains
+4. In either role, process `RxData`/`RxExtendedData` synchronously and clear the
+   event to release the borrowed payload. Automatic receive-window replenishment remains
    the default. An application that needs bounded downstream backpressure may
    call `setAutoChannelReadCreditEnabled(false)` before any channel opens.
    Clearing a borrowed data event then releases sshz's packet storage without
-   crediting the peer. After consuming or durably buffering bytes, call
+   crediting the peer. After bytes leave the bounded receive storage, call
    `channelReadConsumed(channel_id, count)` with a positive count no greater
    than that channel's delivered-but-uncredited bytes. Partial credit is
    allowed. Unknown, automatic-credit, closing, and closed channels reject the
@@ -420,12 +421,13 @@ by connection cleanup, not acceptance or an indefinite pending event.
    all earlier data events on that channel have been observed. If EOF and close
    are both received, `ChannelEof` is observed before
    `ChannelClosed(channel_id)`. One channel's EOF or close does not end its
-   peers.
+   peers. Servers can opt into the same received-EOF observation as described
+   below; the default server continues to consume EOF without an event.
 6. `sendChannelEof` ends the local data direction after queued data.
    `channelEofFlushed` reports when that data and EOF have been written to the
    transport. `sendChannelClose` abandons unsent data and starts close exchange.
-   `ChannelClosed` is emitted when the ordinary channel close handshake
-   completes. The channel slot remains reserved until that event is cleared;
+   On a client, `ChannelClosed` is emitted when the ordinary channel close
+   handshake completes. The channel slot remains reserved until that event is cleared;
    clearing it permits slot reuse. Agent channels continue to use
    `AgentChannelClosed`.
 7. After close/end-session, inspect `channelExitResult` for session channels,
@@ -440,6 +442,132 @@ In manual-credit mode, configure `initial_channel_window` no larger than the
 application's bounded per-channel receive storage. sshz does not add a socket
 queue or retain application payload after the borrowed receive event is
 cleared.
+
+## Server PTY admission and bounded execution streams
+
+These methods remain transport-agnostic: they neither create a PTY nor launch,
+signal, wait for, or supervise a child. The embedding application owns those
+operations and must submit the result of its actual child wait, not infer a
+result from SSH acceptance, EOF, or connection health.
+
+### PTY requests and received EOF
+
+Call `server.setServerChannelEventsEnabled(true)` before authentication to
+enable two additive events. The option defaults to false and cannot change
+after authentication/channel allocation. Client calls return
+`UnimplementedService`.
+
+`PtyRequest` contains `channel`, `term`, `cols`, `rows`, `width_px`,
+`height_px`, `modes`, and `want_reply`. Terminal and modes strings borrow the
+complete, validated packet until the request is decided. Packet/resource
+limits bound both strings; truncated strings and trailing packet data fail
+before an event is emitted. Modes are opaque RFC 4254 bytes, including any
+stop opcode and suffix, with no truncation or implicit terminal configuration.
+The application must parse modes according to RFC 4254 (including stopping
+on opcodes 160-255), bound any copied state, validate dimensions and
+terminal policy, and finish PTY setup before accepting.
+
+Call exactly one of `acceptPtyRequest(channel)` or
+`rejectPtyRequest(channel)`. These release the borrowed event and send
+`CHANNEL_SUCCESS` (99) or `CHANNEL_FAILURE` (100) only when `want_reply` is
+true. A wrong channel or generic `clearEvent(PtyRequest)` fails without
+releasing the pending request. Rejection does not itself close the channel;
+close explicitly when policy requires it. Closing before the decision abandons
+the response rather than acknowledging a closed channel. With observation
+disabled, valid PTY requests retain their previous automatic acceptance.
+Existing `ChannelRequest.Exec`/shell/environment/agent decision semantics do
+not change; this is not a new generic exec rejection API.
+
+`ChannelEof(channel)` is emitted once, after earlier received data has been
+processed, for a non-closing ordinary channel. Clear it after recording the
+half-close. It ends only peer-to-server data; server output, an actual child
+wait, exit-result submission, and local EOF can still follow. Duplicate EOF
+does not produce another event. Server close still releases the channel
+internally and emits `EndSession` when the last channel closes; it does not
+add the client's `ChannelClosed` event.
+
+### Manual input credit and extended output
+
+`setAutoChannelReadCreditEnabled(false)` and
+`channelReadConsumed(channel, count)` now apply to either role. Select the
+mode before any channel opens. Ordinary session and forwarding channels use
+the selected mode; agent channels retain automatic credit. Configure the initial window
+to fit **caller-owned** input storage: the default is still 2 MiB per channel,
+not sshz's smaller borrowed packet/write-buffer capacity. Clearing a data
+event does not return manual credit. Return credit only when bytes actually
+leave bounded storage or are accepted by its downstream sink, so credited
+space can be reused. This permits continued SSH control processing, including
+keepalive, EOF and rekey, while a child input sink is blocked. Credit cannot
+be returned twice; pending adjustments preserve exact channel accounting
+through partial writes and rekey.
+
+For server stderr, borrow `getChannelWriteBuffer(channel)`, copy at most its
+length, and immediately call
+`channelExtendedWriteComplete(channel, data_type, count)`; data type 1 is
+stderr. Normal `channelWriteComplete` and extended submission share one
+bounded per-channel buffer, peer window and packet limit. A split packet
+retains its original data type and unsent suffix. An empty borrow or
+`cannotAcceptWrite` is backpressure: pump protocol work, acquire a fresh
+borrow, and retry the same unaccepted bytes. `cannotAcceptWrite` commits no
+offered bytes or window/cipher advancement. Advance application offsets only
+on success. Client extended submission is unsupported.
+
+### Owned exit results and ordered handoff
+
+After every child output byte has been **accepted** by the appropriate data
+submission method, call one of:
+
+```zig
+try server.sendChannelExitStatus(channel, status);
+try server.sendChannelExitSignal(channel, .{
+    .signal_name = "TERM",
+    .core_dumped = false,
+    .error_message = "",
+    .language_tag = "",
+});
+```
+
+These queue an actual `exit-status` or `exit-signal` channel request with
+`want_reply=false`, copying the whole result before returning. Signal names
+must be nonempty; name/message/language bounds are 64/1,024/64 bytes, published
+by `ResourceCapacities`. The complete packet must also fit the configured
+payload limit, conservatively allowing compression overhead. Invalid size,
+channel, duplicate submission, and local event backpressure fail before
+acceptance. An undecided event returns `cannotAcceptWrite`.
+
+One result is permitted per accepted `Session` channel, not a forwarding or
+agent channel. It must be submitted before local EOF/CLOSE, and it prevents
+later data or result submission. Already accepted data drains first, including
+extended-data suffixes stalled by peer-window exhaustion or rekey. The result
+itself does not consume channel-window credit. A later `sendChannelEof`
+follows the result; neither result API automatically sends EOF or CLOSE.
+Received EOF does not prohibit result submission.
+
+`serverChannelExitStatus(channel)` returns an optional value-owned snapshot
+with `channel`, `transmission` (`Queued`, `Emitting`, `HandedToTransport`),
+and `abandoned`. `Queued` is not framed; `Emitting` includes partially
+consumed packets; handoff occurs only after `consumed` accounts for every
+packet byte. It proves neither peer receipt nor child/application success.
+`channelEofFlushed` additionally waits for all preceding data and result
+handoff. A buffering transport must preserve its ordered queue and track an
+actual-flush watermark; enqueue/handoff must not be reported as TCP flush.
+
+`sendChannelClose` retains its cancellation semantics: it abandons unframed
+data/results rather than waiting indefinitely for credit. A framed result
+cannot be removed from the byte stream and must drain before close; its
+snapshot can therefore become `HandedToTransport` while still
+`abandoned=true`. Peer close, disconnect, and fail-closed cleanup abandon
+pending observations, never fabricate handoff, and preserve an already
+completed handoff. Status snapshots survive channel removal and `EndSession`.
+`clearServerChannelExitStatus(channel)` releases storage only after removal
+or session end. Up to `max_channels` submissions can be retained; when full,
+a new submission returns `ResourceLimitExceeded` without accepting it.
+Nothing is silently evicted or attributed to a later channel.
+
+The production server example's in-memory encrypted cases cover PTY/no-PTY,
+status/signal, partial duplex writes, manual input/output credit, independent
+pre-acknowledgment keepalive, EOF/close, and actual rekey. They do not execute
+children or establish interoperability with another SSH implementation.
 
 ## Limits, deadlines, and rekey
 
@@ -475,6 +603,10 @@ around backpressure.
   keepalive result is the documented contention case above.
   `UnexpectedResponse` from `discardUnframedChannelWrite` identifies an invalid
   channel lifecycle for that local operation, not newly received peer input.
+  Server exit submission similarly uses `UnexpectedResponse` for an invalid
+  channel/lifecycle, empty signal name, or duplicate result, `tooBig` for
+  local size bounds, and `ResourceLimitExceeded` for retained-slot contention;
+  these local rejections do not accept or partially queue a result.
   Correct the poll/accounting state; never drop or duplicate bytes.
 - `BufferError`, malformed framing/MAC, negotiation, unexpected response,
   channel-window/packet, auth/KEX/resource, host-key-change, and
