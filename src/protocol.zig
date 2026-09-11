@@ -383,6 +383,8 @@ pub const IoSessionState = union(enum) {
     VersionReadLine,
     VersionReadLineChar: []const u8,
     VersionReadLineCompletion: []const u8,
+    // Independent output leaves the live receive continuation intact. The
+    // writer and completePreservedWrite own its outbound bookkeeping.
     WriteCompletePreserveState,
     GlobalRequestWriteComplete,
     ChannelWriteComplete: u32,

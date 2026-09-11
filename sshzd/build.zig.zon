@@ -1,6 +1,6 @@
 .{
     .name = .sshzd,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0xd811ccd545c2a0f4,
     .dependencies = .{
         .sshz = .{ .path = ".." },

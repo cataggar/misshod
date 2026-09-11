@@ -1606,6 +1606,8 @@ pub fn SshzImpl(role: Role) type {
                                     return err;
                                 };
                             },
+                            // Serialized writes replace the handled receive state.
+                            // Duplex writes must use a preserving completion above.
                             else => self.session.setIoSessionState(iotype.next_state),
                         }
                         try self.advance();
@@ -2505,11 +2507,10 @@ pub fn SshzImpl(role: Role) type {
             switch (role) {
                 .Client => return IoError.UnimplementedService,
                 .Server => {
-                    self.iostate_rd = .Idle;
-                    self.iostate_wr = .Idle;
-                    const channel_id = try self.session.openAgentChannel();
-                    try self.advance();
-                    return channel_id;
+                    return self.session.openAgentChannelDirect(self) catch |err| {
+                        self.latchKeyLifetimeError(err);
+                        return err;
+                    };
                 },
             }
         }

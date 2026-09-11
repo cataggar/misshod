@@ -668,7 +668,7 @@ pub const Session = struct {
                     try pkt.writeU32(chan.tcpip_open.originator_port);
                 }
                 chan.state = .OpenSent;
-                try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .ReadPktHdr);
+                try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .WriteCompletePreserveState);
                 self.active_channel_id = null;
             },
             .ConfirmWrite => {
@@ -764,7 +764,8 @@ pub const Session = struct {
                     try pkt.writeU32(self.limits.initial_channel_window);
                     try pkt.writeU32(self.limits.channel_packet_size);
                     chan.state = .OpenSent;
-                    try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .ReadPktHdr);
+                    try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .WriteCompletePreserveState);
+                    self.active_channel_id = null;
                 } else {
                     self.setIoSessionState(.ReadPktHdr);
                 }
@@ -1253,6 +1254,14 @@ pub const Session = struct {
         self.resumeChannelActive();
         self.setIoSessionState(.Idle);
         return chan.local_id;
+    }
+
+    pub fn openAgentChannelDirect(self: *Self, sshz: *SshzServer) SshzError!u32 {
+        if (sshz.iostate_wr != .Idle or self.active_channel_id != null)
+            return IoError.cannotAcceptWrite;
+        const channel_id = try self.openAgentChannel();
+        try self.advanceChannel(sshz, &self.keydata.s2c);
+        return channel_id;
     }
 
     // special case as we write direct to stream before entering binary pkt mode

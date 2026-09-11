@@ -1129,7 +1129,7 @@ pub const Session = struct {
                     try pkt.writeU32(chan.tcpip_open.originator_port);
                 }
                 chan.state = .OpenSent;
-                try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
+                try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .WriteCompletePreserveState);
                 self.setSessionState(.ChannelOpenRsp);
             },
             .Open => {
